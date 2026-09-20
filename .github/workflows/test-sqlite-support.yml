@@ -1,0 +1,41 @@
+name: Test SQLite versions
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.platform }}
+    continue-on-error: true
+    strategy:
+      matrix:
+        platform: [ubuntu-latest]
+        python-version: ["3.10"]
+        sqlite-version: [
+          "3.46",
+          "3.23.1", # 2018-04-10, before UPSERT
+        ]
+    steps:
+    - uses: actions/checkout@v7
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+        allow-prereleases: true
+        cache: pip
+        cache-dependency-path: pyproject.toml
+    - name: Set up SQLite ${{ matrix.sqlite-version }}
+      uses: ./.github/actions/setup-sqlite-version
+      with:
+        version: ${{ matrix.sqlite-version }}
+        cflags: "-DSQLITE_ENABLE_DESERIALIZE -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_FTS3_PARENTHESIS -DSQLITE_ENABLE_RTREE -DSQLITE_ENABLE_JSON1"
+    - run: python3 -c "import sqlite3; print(sqlite3.sqlite_version)"
+    - name: Install dependencies
+      run: |
+        pip install . --group dev
+        pip freeze
+    - name: Run tests
+      run: |
+        python -m pytest

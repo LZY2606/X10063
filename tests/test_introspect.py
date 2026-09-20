@@ -1,0 +1,423 @@
+import pytest
+
+from sqlite_utils.db import Check, Database, Index, Table, View, XIndex, XIndexColumn
+
+
+def _check_supports_strict():
+    """Check if SQLite supports strict tables without leaking the database."""
+    db = Database(memory=True)
+    result = db.supports_strict
+    db.close()
+    return result
+
+
+def test_table_names(existing_db):
+    assert ["foo"] == existing_db.table_names()
+
+
+def test_view_names(fresh_db):
+    fresh_db.create_view("foo_view", "select 1")
+    assert ["foo_view"] == fresh_db.view_names()
+
+
+def test_table_names_fts4(existing_db):
+    existing_db.table("woo").insert({"title": "Hello"}).enable_fts(
+        ["title"], fts_version="FTS4"
+    )
+    existing_db.table("woo2").insert({"title": "Hello"}).enable_fts(
+        ["title"], fts_version="FTS5"
+    )
+    assert ["woo_fts"] == existing_db.table_names(fts4=True)
+    assert ["woo2_fts"] == existing_db.table_names(fts5=True)
+
+
+def test_detect_fts(existing_db):
+    existing_db.table("woo").insert({"title": "Hello"}).enable_fts(
+        ["title"], fts_version="FTS4"
+    )
+    existing_db.table("woo2").insert({"title": "Hello"}).enable_fts(
+        ["title"], fts_version="FTS5"
+    )
+    assert "woo_fts" == existing_db.table("woo").detect_fts()
+    assert "woo_fts" == existing_db.table("woo_fts").detect_fts()
+    assert "woo2_fts" == existing_db.table("woo2").detect_fts()
+    assert "woo2_fts" == existing_db.table("woo2_fts").detect_fts()
+    assert existing_db.table("foo").detect_fts() is None
+
+
+@pytest.mark.parametrize("reverse_order", (True, False))
+def test_detect_fts_similar_tables(fresh_db, reverse_order):
+    # https://github.com/simonw/sqlite-utils/issues/434
+    table1, table2 = ("demo", "demo2")
+    if reverse_order:
+        table1, table2 = table2, table1
+
+    fresh_db.table(table1).insert({"title": "Hello"}).enable_fts(
+        ["title"], fts_version="FTS4"
+    )
+    fresh_db.table(table2).insert({"title": "Hello"}).enable_fts(
+        ["title"], fts_version="FTS4"
+    )
+    assert fresh_db.table(table1).detect_fts() == f"{table1}_fts"
+    assert fresh_db.table(table2).detect_fts() == f"{table2}_fts"
+
+
+def test_tables(existing_db):
+    assert len(existing_db.tables) == 1
+    assert existing_db.tables[0].name == "foo"
+
+
+def test_views(fresh_db):
+    fresh_db.create_view("foo_view", "select 1")
+    assert len(fresh_db.views) == 1
+    view = fresh_db.views[0]
+    assert isinstance(view, View)
+    assert view.name == "foo_view"
+    assert repr(view) == "<View foo_view (1)>"
+    assert view.columns_dict == {"1": str}
+
+
+def test_getitem_returns_table_or_view(fresh_db):
+    fresh_db.table("items").insert({"id": 1}, pk="id")
+    fresh_db.create_view("item_ids", "select id from items")
+
+    assert isinstance(fresh_db["items"], Table)
+    assert isinstance(fresh_db["item_ids"], View)
+
+
+def test_count(existing_db):
+    assert existing_db.table("foo").count == 3
+    assert existing_db.table("foo").count_where() == 3
+    assert existing_db.table("foo").execute_count() == 3
+
+
+def test_count_where(existing_db):
+    assert existing_db.table("foo").count_where("text != ?", ["two"]) == 2
+    assert existing_db.table("foo").count_where("text != :t", {"t": "two"}) == 2
+
+
+def test_columns(existing_db):
+    table = existing_db.table("foo")
+    assert [{"name": "text", "type": "TEXT"}] == [
+        {"name": col.name, "type": col.type} for col in table.columns
+    ]
+
+
+def test_table_schema(existing_db):
+    assert existing_db.table("foo").schema == "CREATE TABLE foo (text TEXT)"
+
+
+def test_database_schema(existing_db):
+    assert existing_db.schema == "CREATE TABLE foo (text TEXT);"
+
+
+def test_table_repr(fresh_db):
+    table = fresh_db.table("dogs").insert({"name": "Cleo", "age": 4})
+    assert "<Table dogs (name, age)>" == repr(table)
+    assert "<Table cats (does not exist yet)>" == repr(fresh_db.table("cats"))
+
+
+def test_indexes(fresh_db):
+    fresh_db.executescript("""
+        create table Gosh (c1 text, c2 text, c3 text);
+        create index Gosh_c1 on Gosh(c1);
+        create index Gosh_c2c3 on Gosh(c2, c3);
+    """)
+    assert [
+        Index(
+            seq=0,
+            name="Gosh_c2c3",
+            unique=0,
+            origin="c",
+            partial=0,
+            columns=["c2", "c3"],
+        ),
+        Index(seq=1, name="Gosh_c1", unique=0, origin="c", partial=0, columns=["c1"]),
+    ] == fresh_db.table("Gosh").indexes
+
+
+def test_xindexes(fresh_db):
+    fresh_db.executescript("""
+        create table Gosh (c1 text, c2 text, c3 text);
+        create index Gosh_c1 on Gosh(c1);
+        create index Gosh_c2c3 on Gosh(c2, c3 desc);
+    """)
+    assert fresh_db.table("Gosh").xindexes == [
+        XIndex(
+            name="Gosh_c2c3",
+            columns=[
+                XIndexColumn(seqno=0, cid=1, name="c2", desc=0, coll="BINARY", key=1),
+                XIndexColumn(seqno=1, cid=2, name="c3", desc=1, coll="BINARY", key=1),
+                XIndexColumn(seqno=2, cid=-1, name=None, desc=0, coll="BINARY", key=0),
+            ],
+        ),
+        XIndex(
+            name="Gosh_c1",
+            columns=[
+                XIndexColumn(seqno=0, cid=0, name="c1", desc=0, coll="BINARY", key=1),
+                XIndexColumn(seqno=1, cid=-1, name=None, desc=0, coll="BINARY", key=0),
+            ],
+        ),
+    ]
+
+
+def test_indexes_with_double_quotes_in_identifiers(fresh_db):
+    fresh_db['Go"sh'].insert({"id": 1, 'c"1': 2}, pk="id")
+    fresh_db['Go"sh'].create_index(['c"1'])
+    assert [(index.name, index.columns) for index in fresh_db['Go"sh'].indexes] == [
+        ('idx_Go"sh_c"1', ['c"1'])
+    ]
+    assert fresh_db['Go"sh'].xindexes == [
+        XIndex(
+            name='idx_Go"sh_c"1',
+            columns=[
+                XIndexColumn(seqno=0, cid=1, name='c"1', desc=0, coll="BINARY", key=1),
+                XIndexColumn(seqno=1, cid=-1, name=None, desc=0, coll="BINARY", key=0),
+            ],
+        )
+    ]
+
+
+def test_transform_table_with_double_quotes_in_identifiers(fresh_db):
+    fresh_db['Go"sh'].insert({"id": 1, 'c"1': 2, "c2": 3}, pk="id")
+    fresh_db['Go"sh'].create_index(['c"1'])
+    fresh_db['Go"sh'].transform(types={"c2": str})
+    assert fresh_db['Go"sh'].columns_dict["c2"] is str
+    assert [index.columns for index in fresh_db['Go"sh'].indexes] == [['c"1']]
+
+
+@pytest.mark.parametrize(
+    "column,expected_table_guess",
+    (
+        ("author", "authors"),
+        ("author_id", "authors"),
+        ("authors", "authors"),
+        ("genre", "genre"),
+        ("genre_id", "genre"),
+    ),
+)
+def test_guess_foreign_table(fresh_db, column, expected_table_guess):
+    fresh_db.create_table("authors", {"name": str})
+    fresh_db.create_table("genre", {"name": str})
+    assert expected_table_guess == fresh_db.table("books").guess_foreign_table(column)
+
+
+@pytest.mark.parametrize(
+    "pk,expected", ((None, ["rowid"]), ("id", ["id"]), (["id", "id2"], ["id", "id2"]))
+)
+def test_pks(fresh_db, pk, expected):
+    fresh_db.table("foo").insert_all([{"id": 1, "id2": 2}], pk=pk)
+    assert expected == fresh_db.table("foo").pks
+
+
+def test_checks(fresh_db):
+    fresh_db.execute("""
+        CREATE TABLE scores (
+            score INTEGER CONSTRAINT positive CHECK(score > 0),
+            maximum INTEGER,
+            CONSTRAINT within_maximum CHECK(score <= maximum)
+        )
+    """)
+    scores = fresh_db.table("scores")
+    expected_column = Check("score > 0", name="positive", column="score")
+    expected_table = Check("score <= maximum", name="within_maximum")
+    assert scores.checks == [expected_column, expected_table]
+    assert scores.column_checks == {"score": [expected_column]}
+    assert scores.table_checks == [expected_table]
+    assert scores.checks[0].sql == "CONSTRAINT positive CHECK(score > 0)"
+
+
+def test_checks_nonexistent_and_virtual_tables(fresh_db):
+    assert fresh_db.table("does_not_exist").checks == []
+    fresh_db.table("searchable").insert({"text": "hello"}).enable_fts(
+        ["text"], fts_version="FTS5"
+    )
+    assert fresh_db.table("searchable_fts").checks == []
+
+
+def test_triggers_and_triggers_dict(fresh_db):
+    assert [] == fresh_db.triggers
+    authors = fresh_db.table("authors")
+    authors.insert_all(
+        [
+            {"name": "Frank Herbert", "famous_works": "Dune"},
+            {"name": "Neal Stephenson", "famous_works": "Cryptonomicon"},
+        ]
+    )
+    fresh_db.table("other").insert({"foo": "bar"})
+    assert authors.triggers == []
+    assert authors.triggers_dict == {}
+    assert fresh_db.table("other").triggers == []
+    assert fresh_db.triggers_dict == {}
+    authors.enable_fts(
+        ["name", "famous_works"], fts_version="FTS4", create_triggers=True
+    )
+    expected_triggers = {
+        ("authors_ai", "authors"),
+        ("authors_ad", "authors"),
+        ("authors_au", "authors"),
+    }
+    assert expected_triggers == {(t.name, t.table) for t in fresh_db.triggers}
+    assert expected_triggers == {
+        (t.name, t.table) for t in fresh_db.table("authors").triggers
+    }
+    expected_triggers = {
+        "authors_ai": (
+            'CREATE TRIGGER "authors_ai" AFTER INSERT ON "authors" BEGIN\n'
+            '  INSERT INTO "authors_fts" (rowid, "name", "famous_works") VALUES (new.rowid, new."name", new."famous_works");\n'
+            "END"
+        ),
+        "authors_ad": (
+            'CREATE TRIGGER "authors_ad" AFTER DELETE ON "authors" BEGIN\n'
+            '  INSERT INTO "authors_fts" ("authors_fts", rowid, "name", "famous_works") VALUES(\'delete\', old.rowid, old."name", old."famous_works");\n'
+            "END"
+        ),
+        "authors_au": (
+            'CREATE TRIGGER "authors_au" AFTER UPDATE ON "authors" BEGIN\n'
+            '  INSERT INTO "authors_fts" ("authors_fts", rowid, "name", "famous_works") VALUES(\'delete\', old.rowid, old."name", old."famous_works");\n'
+            '  INSERT INTO "authors_fts" (rowid, "name", "famous_works") VALUES (new.rowid, new."name", new."famous_works");\nEND'
+        ),
+    }
+    assert authors.triggers_dict == expected_triggers
+    assert fresh_db.table("other").triggers == []
+    assert fresh_db.table("other").triggers_dict == {}
+    assert fresh_db.triggers_dict == expected_triggers
+
+
+def test_has_counts_triggers(fresh_db):
+    authors = fresh_db.table("authors")
+    authors.insert({"name": "Frank Herbert"})
+    assert not authors.has_counts_triggers
+    authors.enable_counts()
+    assert authors.has_counts_triggers
+
+
+@pytest.mark.parametrize(
+    "sql,expected_name,expected_using",
+    [
+        (
+            """
+            CREATE VIRTUAL TABLE foo USING FTS5(name)
+            """,
+            "foo",
+            "FTS5",
+        ),
+        (
+            """
+            CREATE VIRTUAL TABLE "foo" USING FTS4(name)
+            """,
+            "foo",
+            "FTS4",
+        ),
+        (
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS `foo` USING FTS4(name)
+            """,
+            "foo",
+            "FTS4",
+        ),
+        (
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS `foo` USING fts5(name)
+            """,
+            "foo",
+            "FTS5",
+        ),
+        (
+            """
+            CREATE TABLE IF NOT EXISTS `foo` (id integer primary key)
+            """,
+            "foo",
+            None,
+        ),
+    ],
+)
+def test_virtual_table_using(fresh_db, sql, expected_name, expected_using):
+    fresh_db.execute(sql)
+    assert fresh_db.table(expected_name).virtual_table_using == expected_using
+
+
+def test_use_rowid(fresh_db):
+    fresh_db.table("rowid_table").insert({"name": "Cleo"})
+    fresh_db.table("regular_table").insert({"id": 1, "name": "Cleo"}, pk="id")
+    assert fresh_db.table("rowid_table").use_rowid
+    assert not fresh_db.table("regular_table").use_rowid
+
+
+@pytest.mark.skipif(
+    not _check_supports_strict(),
+    reason="Needs SQLite version that supports strict",
+)
+@pytest.mark.parametrize(
+    "create_table,expected_strict",
+    (
+        ("create table t (id integer) strict", True),
+        ("create table t (id integer) STRICT", True),
+        ("create table t (id integer primary key) StriCt, WITHOUT ROWID", True),
+        ("create table t (id integer primary key) WITHOUT ROWID", False),
+        ("create table t (id integer)", False),
+    ),
+)
+def test_table_strict(fresh_db, create_table, expected_strict):
+    fresh_db.execute(create_table)
+    table = fresh_db.table("t")
+    assert table.strict == expected_strict
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        1,
+        1.3,
+        "foo",
+        "O'Brien",
+        True,
+        b"binary",
+    ),
+)
+def test_table_default_values(fresh_db, value):
+    fresh_db.table("default_values").insert(
+        {"nodefault": 1, "value": value}, defaults={"value": value}
+    )
+    default_values = fresh_db.table("default_values").default_values
+    assert default_values == {"value": value}
+
+
+def test_table_default_values_escaped_quotes(fresh_db):
+    # SQLite stores string defaults with single quotes doubled, so
+    # introspection needs to unescape them again
+    fresh_db.execute(
+        "create table t (id integer primary key, name text default 'O''Brien')"
+    )
+    assert "default 'O''Brien'" in fresh_db.table("t").schema
+    assert fresh_db.table("t").default_values == {"name": "O'Brien"}
+
+
+def test_table_default_values_keyword_literals(fresh_db):
+    fresh_db.execute(
+        "create table t ("
+        "enabled integer default TRUE, "
+        "disabled integer default false, "
+        "nullable text default NULL"
+        ")"
+    )
+    assert fresh_db.table("t").default_values == {
+        "enabled": True,
+        "disabled": False,
+        "nullable": None,
+    }
+
+
+def test_pks_use_primary_key_declaration_order(fresh_db):
+    # PRIMARY KEY (a, b) declared against columns stored in order (b, a) -
+    # pks must follow the declaration order, which is what SQLite uses to
+    # resolve implicit foreign key references and compound pk lookups
+    fresh_db.execute("create table t (b text, a text, primary key (a, b))")
+    assert fresh_db.table("t").pks == ["a", "b"]
+
+
+def test_transform_preserves_compound_pk_declaration_order(fresh_db):
+    fresh_db.execute("create table t (a text, b text, c text, primary key (b, a))")
+    fresh_db.table("t").transform(drop={"c"})
+    assert fresh_db.table("t").pks == ["b", "a"]
+    assert 'PRIMARY KEY ("b", "a")' in fresh_db.table("t").schema

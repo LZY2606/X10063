@@ -1,0 +1,343 @@
+import itertools
+
+import pytest
+
+from sqlite_utils import ANY
+from sqlite_utils.db import InvalidColumns
+
+
+@pytest.mark.parametrize("table", [None, "Species"])
+@pytest.mark.parametrize("fk_column", [None, "species"])
+def test_extract_single_column(fresh_db, table, fk_column):
+    expected_table = table or "species"
+    expected_fk = fk_column or f"{expected_table}_id"
+    iter_species = itertools.cycle(["Palm", "Spruce", "Mangrove", "Oak"])
+    fresh_db.table("tree").insert_all(
+        (
+            {
+                "id": i,
+                "name": f"Tree {i}",
+                "species": next(iter_species),
+                "end": 1,
+            }
+            for i in range(1, 1001)
+        ),
+        pk="id",
+    )
+    fresh_db.table("tree").extract("species", table=table, fk_column=fk_column)
+    assert fresh_db.table("tree").schema == (
+        'CREATE TABLE "tree" (\n'
+        '   "id" INTEGER PRIMARY KEY,\n'
+        '   "name" TEXT,\n'
+        f'   "{expected_fk}" INTEGER REFERENCES "{expected_table}"("id"),\n'
+        + '   "end" INTEGER\n'
+        + ")"
+    )
+    assert fresh_db.table(expected_table).schema == (
+        f'CREATE TABLE "{expected_table}" (\n' + '   "id" INTEGER PRIMARY KEY,\n'
+        '   "species" TEXT\n'
+        ")"
+    )
+    assert list(fresh_db.table(expected_table).rows) == [
+        {"id": 1, "species": "Palm"},
+        {"id": 2, "species": "Spruce"},
+        {"id": 3, "species": "Mangrove"},
+        {"id": 4, "species": "Oak"},
+    ]
+    assert list(itertools.islice(fresh_db.table("tree").rows, 0, 4)) == [
+        {"id": 1, "name": "Tree 1", expected_fk: 1, "end": 1},
+        {"id": 2, "name": "Tree 2", expected_fk: 2, "end": 1},
+        {"id": 3, "name": "Tree 3", expected_fk: 3, "end": 1},
+        {"id": 4, "name": "Tree 4", expected_fk: 4, "end": 1},
+    ]
+
+
+def test_extract_multiple_columns_with_rename(fresh_db):
+    iter_common = itertools.cycle(["Palm", "Spruce", "Mangrove", "Oak"])
+    iter_latin = itertools.cycle(["Arecaceae", "Picea", "Rhizophora", "Quercus"])
+    fresh_db.table("tree").insert_all(
+        (
+            {
+                "id": i,
+                "name": f"Tree {i}",
+                "common_name": next(iter_common),
+                "latin_name": next(iter_latin),
+            }
+            for i in range(1, 1001)
+        ),
+        pk="id",
+    )
+
+    fresh_db.table("tree").extract(
+        ["common_name", "latin_name"], rename={"common_name": "name"}
+    )
+    assert fresh_db.table("tree").schema == (
+        'CREATE TABLE "tree" (\n'
+        '   "id" INTEGER PRIMARY KEY,\n'
+        '   "name" TEXT,\n'
+        '   "common_name_latin_name_id" INTEGER REFERENCES "common_name_latin_name"("id")\n'
+        ")"
+    )
+    assert fresh_db.table("common_name_latin_name").schema == (
+        'CREATE TABLE "common_name_latin_name" (\n'
+        '   "id" INTEGER PRIMARY KEY,\n'
+        '   "name" TEXT,\n'
+        '   "latin_name" TEXT\n'
+        ")"
+    )
+    assert list(fresh_db.table("common_name_latin_name").rows) == [
+        {"name": "Palm", "id": 1, "latin_name": "Arecaceae"},
+        {"name": "Spruce", "id": 2, "latin_name": "Picea"},
+        {"name": "Mangrove", "id": 3, "latin_name": "Rhizophora"},
+        {"name": "Oak", "id": 4, "latin_name": "Quercus"},
+    ]
+    assert list(itertools.islice(fresh_db.table("tree").rows, 0, 4)) == [
+        {"id": 1, "name": "Tree 1", "common_name_latin_name_id": 1},
+        {"id": 2, "name": "Tree 2", "common_name_latin_name_id": 2},
+        {"id": 3, "name": "Tree 3", "common_name_latin_name_id": 3},
+        {"id": 4, "name": "Tree 4", "common_name_latin_name_id": 4},
+    ]
+
+
+def test_extract_invalid_columns(fresh_db):
+    fresh_db.table("tree").insert(
+        {
+            "id": 1,
+            "name": "Tree 1",
+            "common_name": "Palm",
+            "latin_name": "Arecaceae",
+        },
+        pk="id",
+    )
+    with pytest.raises(InvalidColumns):
+        fresh_db.table("tree").extract(["bad_column"])
+
+
+def test_extract_rowid_table(fresh_db):
+    fresh_db.table("tree").insert(
+        {
+            "name": "Tree 1",
+            "common_name": "Palm",
+            "latin_name": "Arecaceae",
+        }
+    )
+    fresh_db.table("tree").extract(["common_name", "latin_name"])
+    assert fresh_db.table("tree").schema == (
+        'CREATE TABLE "tree" (\n'
+        '   "name" TEXT,\n'
+        '   "common_name_latin_name_id" INTEGER REFERENCES "common_name_latin_name"("id")\n'
+        ")"
+    )
+    assert fresh_db.execute("""
+        select
+            tree.name,
+            common_name_latin_name.common_name,
+            common_name_latin_name.latin_name
+        from tree
+            join common_name_latin_name
+            on tree.common_name_latin_name_id = common_name_latin_name.id
+    """).fetchall() == [("Tree 1", "Palm", "Arecaceae")]
+
+
+def test_reuse_lookup_table(fresh_db):
+    fresh_db.table("species").insert({"id": 1, "name": "Wolf"}, pk="id")
+    fresh_db.table("sightings").insert({"id": 10, "species": "Wolf"}, pk="id")
+    fresh_db.table("individuals").insert(
+        {"id": 10, "name": "Terriana", "species": "Fox"}, pk="id"
+    )
+    fresh_db.table("sightings").extract("species", rename={"species": "name"})
+    fresh_db.table("individuals").extract("species", rename={"species": "name"})
+    assert fresh_db.table("sightings").schema == (
+        'CREATE TABLE "sightings" (\n'
+        '   "id" INTEGER PRIMARY KEY,\n'
+        '   "species_id" INTEGER REFERENCES "species"("id")\n'
+        ")"
+    )
+    assert fresh_db.table("individuals").schema == (
+        'CREATE TABLE "individuals" (\n'
+        '   "id" INTEGER PRIMARY KEY,\n'
+        '   "name" TEXT,\n'
+        '   "species_id" INTEGER REFERENCES "species"("id")\n'
+        ")"
+    )
+    assert list(fresh_db.table("species").rows) == [
+        {"id": 1, "name": "Wolf"},
+        {"id": 2, "name": "Fox"},
+    ]
+
+
+def test_extract_error_on_incompatible_existing_lookup_table(fresh_db):
+    fresh_db.table("species").insert({"id": 1})
+    fresh_db.table("tree").insert({"name": "Tree 1", "common_name": "Palm"})
+    with pytest.raises(InvalidColumns):
+        fresh_db.table("tree").extract("common_name", table="species")
+
+    # Try again with incompatible existing column type
+    fresh_db.table("species2").insert({"id": 1, "common_name": 3.5})
+    with pytest.raises(InvalidColumns):
+        fresh_db.table("tree").extract("common_name", table="species2")
+
+
+def test_extract_works_with_null_values(fresh_db):
+    fresh_db.table("listens").insert_all(
+        [
+            {"id": 1, "track_title": "foo", "album_title": "bar"},
+            {"id": 2, "track_title": "baz", "album_title": None},
+        ],
+        pk="id",
+    )
+    fresh_db.table("listens").extract(
+        columns=["album_title"], table="albums", fk_column="album_id"
+    )
+    assert list(fresh_db.table("listens").rows) == [
+        {"id": 1, "track_title": "foo", "album_id": 1},
+        {"id": 2, "track_title": "baz", "album_id": None},
+    ]
+    assert list(fresh_db.table("albums").rows) == [
+        {"id": 1, "album_title": "bar"},
+    ]
+
+
+def test_extract_null_values_single_column(fresh_db):
+    # https://github.com/simonw/sqlite-utils/issues/186
+    fresh_db.table("species").insert({"id": 1, "species": "Wolf"}, pk="id")
+    fresh_db.table("individuals").insert_all(
+        [
+            {"id": 10, "name": "Terriana", "species": "Fox"},
+            {"id": 11, "name": "Spenidorm", "species": None},
+            {"id": 12, "name": "Grantheim", "species": "Wolf"},
+            {"id": 13, "name": "Turnutopia", "species": None},
+            {"id": 14, "name": "Wargal", "species": "Wolf"},
+        ],
+        pk="id",
+    )
+    fresh_db.table("individuals").extract("species")
+    # No null row should have been added to species
+    assert list(fresh_db.table("species").rows) == [
+        {"id": 1, "species": "Wolf"},
+        {"id": 2, "species": "Fox"},
+    ]
+    assert list(fresh_db.table("individuals").rows) == [
+        {"id": 10, "name": "Terriana", "species_id": 2},
+        {"id": 11, "name": "Spenidorm", "species_id": None},
+        {"id": 12, "name": "Grantheim", "species_id": 1},
+        {"id": 13, "name": "Turnutopia", "species_id": None},
+        {"id": 14, "name": "Wargal", "species_id": 1},
+    ]
+
+
+def test_extract_null_values_multiple_columns(fresh_db):
+    # A row should be extracted if at least one column is not null -
+    # only rows where ALL extracted columns are null are left alone
+    fresh_db.table("circulation").insert_all(
+        [
+            {"id": 1, "title": "title one", "creator": "creator one", "year": 2018},
+            {"id": 2, "title": "title two", "creator": None, "year": 2019},
+            {"id": 3, "title": None, "creator": None, "year": 2020},
+            {"id": 4, "title": None, "creator": None, "year": 2021},
+        ],
+        pk="id",
+    )
+    fresh_db.table("circulation").extract(
+        ["title", "creator"], table="books", fk_column="book_id"
+    )
+    assert list(fresh_db.table("books").rows) == [
+        {"id": 1, "title": "title one", "creator": "creator one"},
+        {"id": 2, "title": "title two", "creator": None},
+    ]
+    assert list(fresh_db.table("circulation").rows) == [
+        {"id": 1, "book_id": 1, "year": 2018},
+        {"id": 2, "book_id": 2, "year": 2019},
+        {"id": 3, "book_id": None, "year": 2020},
+        {"id": 4, "book_id": None, "year": 2021},
+    ]
+
+
+def test_extract_null_values_existing_lookup_table_with_null_row(fresh_db):
+    # Even if the lookup table already contains an all-null row, rows where
+    # every extracted column is null should keep a null foreign key
+    fresh_db.table("species").insert({"id": 1, "species": None}, pk="id")
+    fresh_db.table("individuals").insert_all(
+        [
+            {"id": 10, "name": "Terriana", "species": "Fox"},
+            {"id": 11, "name": "Spenidorm", "species": None},
+        ],
+        pk="id",
+    )
+    fresh_db.table("individuals").extract("species")
+    assert list(fresh_db.table("species").rows) == [
+        {"id": 1, "species": None},
+        {"id": 2, "species": "Fox"},
+    ]
+    assert list(fresh_db.table("individuals").rows) == [
+        {"id": 10, "name": "Terriana", "species_id": 2},
+        {"id": 11, "name": "Spenidorm", "species_id": None},
+    ]
+
+
+def test_extract_repeated_into_shared_lookup_with_nulls(fresh_db):
+    # Unique indexes treat NULLs as distinct, so INSERT OR IGNORE alone
+    # cannot dedupe NULL-containing rows against the existing lookup
+    # table - extracting a second table into the same lookup previously
+    # inserted duplicate rows that nothing pointed to
+    fresh_db.table("t1").insert_all(
+        [
+            {"id": 1, "species": None, "common": "X"},
+            {"id": 2, "species": "Oak", "common": "Oak"},
+        ],
+        pk="id",
+    )
+    fresh_db.table("t2").insert_all(
+        [{"id": 1, "species": None, "common": "X"}], pk="id"
+    )
+    fresh_db.table("t1").extract(["species", "common"], table="lk")
+    fresh_db.table("t2").extract(["species", "common"], table="lk")
+    assert fresh_db.table("lk").count == 2
+    # Both tables point at the same lookup row
+    t1_fk = fresh_db.execute("select lk_id from t1 where id = 1").fetchone()[0]
+    t2_fk = fresh_db.execute("select lk_id from t2 where id = 1").fetchone()[0]
+    assert t1_fk == t2_fk
+
+
+def test_extract_repeated_into_shared_lookup_no_nulls(fresh_db):
+    # Non-NULL rows were already deduped by the unique index - keep it so
+    fresh_db.table("t1").insert_all([{"id": 1, "species": "Oak"}], pk="id")
+    fresh_db.table("t2").insert_all([{"id": 1, "species": "Oak"}], pk="id")
+    fresh_db.table("t1").extract(["species"], table="lk")
+    fresh_db.table("t2").extract(["species"], table="lk")
+    assert fresh_db.table("lk").count == 1
+
+
+def test_extract_preserves_strict_any(fresh_db):
+    if not fresh_db.supports_strict:
+        pytest.skip("SQLite version does not support strict tables")
+    fresh_db.execute("create table items (id integer primary key, data any) strict")
+    fresh_db.execute("insert into items values (1, ?)", ("000123",))
+
+    fresh_db["items"].extract("data", table="data_values")
+
+    lookup = fresh_db["data_values"]
+    assert lookup.strict is True
+    assert lookup.columns_dict == {"id": int, "data": ANY}
+    assert fresh_db.execute(
+        "select typeof(data), data from data_values"
+    ).fetchone() == ("text", "000123")
+
+
+def test_extract_strict_any_rejects_non_strict_lookup(fresh_db):
+    if not fresh_db.supports_strict:
+        pytest.skip("SQLite version does not support strict tables")
+    fresh_db.execute("create table items (data any) strict")
+    fresh_db.execute("insert into items values (?)", ("000123",))
+    fresh_db.execute("create table data_values (id integer primary key, data any)")
+
+    with pytest.raises(
+        InvalidColumns,
+        match="is not STRICT, so it cannot preserve ANY column values",
+    ):
+        fresh_db["items"].extract("data", table="data_values")
+
+    assert fresh_db.execute("select typeof(data), data from items").fetchone() == (
+        "text",
+        "000123",
+    )
