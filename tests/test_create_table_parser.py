@@ -7,12 +7,14 @@ from hypothesis import given
 from sqlite_utils.create_table_parser import (
     Check,
     ColumnComments,
+    GeneratedColumn,
     ParseError,
     Unique,
     UniqueColumn,
     parse_autoincrement,
     parse_checks,
     parse_column_comments,
+    parse_generated_columns,
     parse_uniques,
 )
 
@@ -241,3 +243,78 @@ def test_check_like_text_inside_strings_is_opaque(value):
     assert len(checks) == 1
     assert checks[0].column == "value"
     assert checks[0].check == f"value != '{value}'"
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    (
+        (
+            "CREATE TABLE t (a TEXT, b AS (a + 1))",
+            GeneratedColumn(
+                name="b",
+                declared_type="",
+                collation="",
+                definition="GENERATED ALWAYS AS (a + 1) VIRTUAL",
+                expression="a + 1",
+                stored=False,
+            ),
+        ),
+        (
+            "CREATE TABLE t (a TEXT, b TEXT GENERATED ALWAYS AS (upper(a)) VIRTUAL)",
+            GeneratedColumn(
+                name="b",
+                declared_type="TEXT",
+                collation="",
+                definition="GENERATED ALWAYS AS (upper(a)) VIRTUAL",
+                expression="upper(a)",
+                stored=False,
+            ),
+        ),
+        (
+            "CREATE TABLE t (a TEXT, b VARCHAR(10) GENERATED ALWAYS AS (a) STORED)",
+            GeneratedColumn(
+                name="b",
+                declared_type="VARCHAR(10)",
+                collation="",
+                definition="GENERATED ALWAYS AS (a) STORED",
+                expression="a",
+                stored=True,
+            ),
+        ),
+        (
+            "CREATE TABLE t (a TEXT, b TEXT COLLATE NOCASE AS (lower(a)) VIRTUAL)",
+            GeneratedColumn(
+                name="b",
+                declared_type="TEXT",
+                collation="NOCASE",
+                definition="GENERATED ALWAYS AS (lower(a)) VIRTUAL",
+                expression="lower(a)",
+                stored=False,
+            ),
+        ),
+    ),
+)
+def test_parse_generated_columns(sql, expected):
+    assert parse_generated_columns(sql) == {"b": expected}
+
+
+def test_parse_generated_column_with_case_expression_containing_as():
+    # The word AS inside the generated expression must not be mistaken for
+    # the column's AS keyword
+    sql = (
+        "CREATE TABLE t (a TEXT DEFAULT ('x AS y'), "
+        "b TEXT GENERATED ALWAYS AS "
+        "(CASE WHEN a IS NULL THEN 'as if' ELSE upper(a) END) VIRTUAL)"
+    )
+    parsed = parse_generated_columns(sql)
+    assert set(parsed) == {"b"}
+    assert "CASE WHEN a IS NULL" in parsed["b"].expression
+
+
+def test_parse_generated_columns_ignores_plain_table():
+    sql = 'CREATE TABLE t (a TEXT DEFAULT ("x AS y"), c INTEGER NOT NULL)'
+    assert parse_generated_columns(sql) == {}
+
+
+def test_parse_generated_columns_virtual_table():
+    assert parse_generated_columns("CREATE VIRTUAL TABLE x USING fts5(a)") == {}

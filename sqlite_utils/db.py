@@ -29,6 +29,7 @@ from sqlite_utils.plugins import ensure_plugins_loaded, pm
 from .create_table_parser import (
     Check,
     ColumnComments,
+    GeneratedColumn,
     ParseError,
     Unique,
     UniqueColumn,
@@ -36,6 +37,7 @@ from .create_table_parser import (
     parse_autoincrement,
     parse_checks,
     parse_column_comments,
+    parse_generated_columns,
     parse_uniques,
     rewrite_check_expression,
     sql_ends_in_line_comment,
@@ -320,6 +322,172 @@ XIndexColumn = namedtuple(
     "XIndexColumn", ("seqno", "cid", "name", "desc", "coll", "key")
 )
 Trigger = namedtuple("Trigger", ("name", "table", "sql"))
+
+
+@dataclass(frozen=True)
+class ColumnMapping:
+    """
+    How one output column of a transformed table is populated.
+
+    ``source`` is the name of the column copied in the existing table, or
+    ``None`` when the output column is new (populated with its default or
+    NULL). ``destination`` is the column name in the rebuilt table and
+    ``generated`` is True for generated columns, which are not copied at all.
+    ``type_change`` records the old and new declared types when they differ.
+    """
+
+    destination: str
+    source: str | None
+    generated: bool = False
+    type_change: tuple[str, str] | None = None
+
+    def __str__(self) -> str:
+        if self.generated:
+            return "{destination} GENERATED".format(destination=self.destination)
+        if self.source is None:
+            return "{destination} (new)".format(destination=self.destination)
+        text = (
+            self.source
+            if self.source == self.destination
+            else "{source} -> {destination}".format(
+                source=self.source, destination=self.destination
+            )
+        )
+        if self.type_change:
+            text += " ({old} -> {new})".format(
+                old=self.type_change[0], new=self.type_change[1]
+            )
+        return text
+
+
+@dataclass(frozen=True)
+class TransformPlan:
+    """
+    The dry-run plan for a :meth:`Table.transform` call.
+
+    Returned by :meth:`Table.plan_transform`. The plan is a pure description:
+    building it writes nothing to the database, and for an unchanged schema two
+    plans produced in succession are byte-for-byte identical.
+
+    ``sql_steps`` holds every statement executed, in order. ``columns`` maps
+    old to new column names, ``dropped_columns`` lists removed columns and
+    ``new_columns`` lists columns added by the rebuild. ``indexes_preserved``,
+    ``indexes_rebuilt`` and ``indexes_lost`` describe the index handling, as do
+    the matching trigger lists. ``foreign_keys_added``,
+    ``foreign_keys_removed`` and ``foreign_keys_preserved`` describe foreign
+    key handling, and ``dependencies``/``warnings`` flag related objects such
+    as FTS shadow tables that reference the table.
+    """
+
+    table: str
+    sql_steps: list[str]
+    columns: list[ColumnMapping]
+    dropped_columns: tuple[str, ...]
+    new_columns: tuple[str, ...]
+    indexes_preserved: tuple[str, ...]
+    indexes_rebuilt: tuple[str, ...]
+    indexes_lost: tuple[str, ...]
+    triggers_preserved: tuple[str, ...]
+    triggers_rebuilt: tuple[str, ...]
+    triggers_lost: tuple[str, ...]
+    foreign_keys_preserved: tuple[ForeignKey, ...]
+    foreign_keys_added: tuple[ForeignKey, ...]
+    foreign_keys_removed: tuple[ForeignKey, ...]
+    dependencies: tuple[str, ...]
+    warnings: tuple[str, ...]
+    tmp_table: str
+    keep_table: str | None = None
+
+    @property
+    def sql(self) -> str:
+        "All planned statements joined into one SQL script."
+        return "\n".join(self.sql_steps)
+
+    def __str__(self) -> str:
+        lines = ["Transform plan for table {!r}:".format(self.table)]
+        lines.append("Columns:")
+        lines.extend("  - {}".format(column) for column in self.columns)
+        if self.dropped_columns:
+            lines.append("Dropped columns: {}".format(", ".join(self.dropped_columns)))
+        if self.new_columns:
+            lines.append("New columns: {}".format(", ".join(self.new_columns)))
+        lines.append(
+            "Indexes preserved: {}".format(", ".join(self.indexes_preserved) or "none")
+        )
+        lines.append(
+            "Indexes rebuilt: {}".format(", ".join(self.indexes_rebuilt) or "none")
+        )
+        lines.append("Indexes lost: {}".format(", ".join(self.indexes_lost) or "none"))
+        lines.append(
+            "Triggers preserved: {}".format(
+                ", ".join(self.triggers_preserved) or "none"
+            )
+        )
+        lines.append(
+            "Triggers rebuilt: {}".format(", ".join(self.triggers_rebuilt) or "none")
+        )
+        lines.append(
+            "Triggers lost: {}".format(", ".join(self.triggers_lost) or "none")
+        )
+        if self.foreign_keys_added or self.foreign_keys_removed:
+            lines.append(
+                "Foreign keys added: {}".format(
+                    ", ".join(_fk_label(fk) for fk in self.foreign_keys_added)
+                    or "none",
+                )
+            )
+            lines.append(
+                "Foreign keys removed: {}".format(
+                    ", ".join(_fk_label(fk) for fk in self.foreign_keys_removed)
+                    or "none",
+                )
+            )
+            lines.append(
+                "Foreign keys preserved: {}".format(
+                    ", ".join(_fk_label(fk) for fk in self.foreign_keys_preserved)
+                    or "none",
+                )
+            )
+        if self.dependencies:
+            lines.append("Dependencies: {}".format(", ".join(self.dependencies)))
+        for warning in self.warnings:
+            lines.append("WARNING: {}".format(warning))
+        lines.append("SQL steps:")
+        lines.extend(
+            "  {}. {}".format(i + 1, sql) for i, sql in enumerate(self.sql_steps)
+        )
+        return "\n".join(lines)
+
+
+def _fk_label(fk: ForeignKey) -> str:
+    return "{columns} -> {other_table}({other_columns})".format(
+        columns=", ".join(fk.columns),
+        other_table=fk.other_table,
+        other_columns=", ".join(fk.other_columns),
+    )
+
+
+@dataclass
+class _TransformParts:
+    "Internal result of planning a transform, shared by the plan and execution."
+
+    tmp_table: str
+    keep_table: str | None
+    sql_steps: list[str]
+    column_mappings: list[ColumnMapping]
+    dropped_columns: tuple[str, ...]
+    new_columns: tuple[str, ...]
+    indexes_preserved: tuple[str, ...]
+    indexes_rebuilt: tuple[str, ...]
+    indexes_lost: tuple[str, ...]
+    triggers_preserved: tuple[str, ...]
+    triggers_rebuilt: tuple[str, ...]
+    triggers_lost: tuple[str, ...]
+    foreign_keys_preserved: tuple[ForeignKey, ...]
+    foreign_keys_added: tuple[ForeignKey, ...]
+    foreign_keys_removed: tuple[ForeignKey, ...]
+    dependencies: tuple[str, ...]
+    warnings: list[str]
 
 
 class TransformError(Exception):
@@ -1444,6 +1612,7 @@ class Database:
         _column_comments: Mapping[str, ColumnComments] | None = None,
         _autoincrement: str | None = None,
         _uniques: Iterable[Unique] | None = None,
+        _generated: Mapping[str, GeneratedColumn] | None = None,
     ) -> str:
         """
         Returns the SQL ``CREATE TABLE`` statement for creating the specified table.
@@ -1494,6 +1663,7 @@ class Database:
             for name, comments in (_column_comments or {}).items()
         }
         checks = list(_checks or ())
+        generated = dict(_generated or {})
         checks_by_column: dict[str, list[Check]] = {}
         table_checks: list[Check] = []
         for check in checks:
@@ -1641,6 +1811,17 @@ class Database:
             # Refs https://github.com/simonw/sqlite-utils/issues/644
             if strict and column_type_str == "FLOAT":
                 column_type_str = "REAL"
+            generated_column = generated.get(column_name)
+            if generated_column is not None:
+                # A generated column cannot carry a REFERENCES, PRIMARY KEY
+                # or DEFAULT clause - any such extras would be invalid SQL.
+                column_extras = [
+                    extra
+                    for extra in column_extras
+                    if not extra.startswith(("PRIMARY KEY", "REFERENCES", "DEFAULT"))
+                ]
+                if generated_column.declared_type:
+                    column_type_str = generated_column.declared_type
             column_definition = "   {} {column_type}{column_extras}".format(
                 quote_identifier(column_name),
                 column_type=column_type_str,
@@ -1648,6 +1829,15 @@ class Database:
                     (" " + " ".join(column_extras)) if column_extras else ""
                 ),
             )
+            if generated_column is not None:
+                if generated_column.collation:
+                    raise TransformError(
+                        "Cannot transform table {!r}: generated column {!r} "
+                        "uses a COLLATE clause, which cannot yet be recreated "
+                        "by transform(). Drop and recreate the table manually "
+                        "instead.".format(name, column_name)
+                    )
+                column_definition += " " + generated_column.definition
             column_defs.append(
                 _column_definition_with_comments(
                     column_definition, column_comments.get(column_name)
@@ -2655,12 +2845,19 @@ class Table(Queryable):
         column_order: list[str] | None = None,
         keep_table: str | None = None,
         strict: bool | None = None,
+        plan: "TransformPlan | None" = None,
     ) -> "Table":
         """
         Apply an advanced alter table, including operations that are not supported by
         ``ALTER TABLE`` in SQLite itself.
 
         See :ref:`python_api_transform` for full details.
+
+        Every statement runs inside a single transaction: if any step fails
+        the transaction is rolled back and the original table, indexes and
+        triggers are left in place. Pass a :class:`TransformPlan` from
+        :meth:`plan_transform` as ``plan`` to execute exactly that plan; when
+        omitted the plan is built from the other arguments.
 
         Raises :py:class:`sqlite_utils.db.TransactionError` if called while a
         transaction is open with ``PRAGMA foreign_keys`` enabled and the table
@@ -2684,23 +2881,63 @@ class Table(Queryable):
           dropped
         :param strict: Set to ``True`` to make the table strict or ``False`` to make it
           non-strict. Defaults to ``None``, which preserves the existing strict mode.
+        :param plan: A pre-built :class:`TransformPlan` to execute, instead of
+          building one from the other arguments
         """
         if not self.exists():
             raise ValueError("Cannot transform a table that doesn't exist yet")
-        sqls = self.transform_sql(
-            types=types,
-            rename=rename,
-            drop=drop,
-            pk=pk,
-            not_null=not_null,
-            defaults=defaults,
-            drop_foreign_keys=drop_foreign_keys,
-            add_foreign_keys=add_foreign_keys,
-            foreign_keys=foreign_keys,
-            column_order=column_order,
-            keep_table=keep_table,
-            strict=strict,
-        )
+        if plan is not None:
+            conflicting = [
+                key
+                for key, value in (
+                    ("types", types),
+                    ("rename", rename),
+                    ("drop", drop),
+                    ("pk", None if pk is DEFAULT else pk),
+                    ("not_null", not_null),
+                    ("defaults", defaults),
+                    ("drop_foreign_keys", drop_foreign_keys),
+                    ("add_foreign_keys", add_foreign_keys),
+                    ("foreign_keys", foreign_keys),
+                    ("column_order", column_order),
+                    ("keep_table", keep_table),
+                    ("strict", strict),
+                )
+                if value is not None
+            ]
+            if conflicting:
+                raise ValueError(
+                    "Cannot pass transformation arguments together with plan=; "
+                    "got: {}".format(", ".join(conflicting))
+                )
+            if plan.table != self.name:
+                raise ValueError(
+                    "Plan was built for table {!r} but transform() was called "
+                    "on table {!r}.".format(plan.table, self.name)
+                )
+            if self.db[plan.tmp_table].exists():
+                raise TransformError(
+                    "Cannot execute plan for table {!r}: temporary table "
+                    "{!r} already exists. Build a fresh plan with "
+                    "plan_transform() (or pass a different tmp_suffix=) before "
+                    "executing it.".format(self.name, plan.tmp_table)
+                )
+            sqls = list(plan.sql_steps)
+        else:
+            sqls = self.transform_sql(
+                types=types,
+                rename=rename,
+                drop=drop,
+                pk=pk,
+                not_null=not_null,
+                defaults=defaults,
+                drop_foreign_keys=drop_foreign_keys,
+                add_foreign_keys=add_foreign_keys,
+                foreign_keys=foreign_keys,
+                column_order=column_order,
+                keep_table=keep_table,
+                strict=strict,
+            )
         pragma_foreign_keys_was_on = bool(
             self.db.execute("PRAGMA foreign_keys").fetchone()[0]
         )
@@ -2772,6 +3009,62 @@ class Table(Queryable):
 
     def transform_sql(
         self,
+        *args,
+        **kwargs,
+    ) -> list[str]:
+        """
+        Return the list of SQL statements that :meth:`transform` would run.
+
+        The statements are byte-for-byte the ones that :meth:`transform`
+        executes. For richer information including column mappings, index and
+        trigger handling and foreign key changes use :meth:`plan_transform`.
+        """
+        if not self.exists():
+            raise ValueError("Cannot transform a table that doesn't exist yet")
+        return self._build_transform(*args, **kwargs).sql_steps
+
+    def plan_transform(
+        self,
+        *args,
+        **kwargs,
+    ) -> "TransformPlan":
+        """
+        Build a dry-run :class:`TransformPlan` for this transformation.
+
+        Planning performs every validation that :meth:`transform` does but
+        writes nothing to the database. Calling this twice against the same
+        schema and arguments produces a byte-for-byte identical plan. The
+        plan's ``sql_steps`` are the exact statements that ``transform()``
+        would execute, and the other attributes describe how columns, indexes,
+        triggers and foreign keys are handled.
+        """
+        if not self.exists():
+            raise ValueError("Cannot transform a table that doesn't exist yet")
+        kwargs.setdefault("deterministic_tmp_suffix", True)
+        parts = self._build_transform(*args, **kwargs)
+        return TransformPlan(
+            table=self.name,
+            sql_steps=parts.sql_steps,
+            columns=parts.column_mappings,
+            dropped_columns=parts.dropped_columns,
+            new_columns=parts.new_columns,
+            indexes_preserved=parts.indexes_preserved,
+            indexes_rebuilt=parts.indexes_rebuilt,
+            indexes_lost=parts.indexes_lost,
+            triggers_preserved=parts.triggers_preserved,
+            triggers_rebuilt=parts.triggers_rebuilt,
+            triggers_lost=parts.triggers_lost,
+            foreign_keys_preserved=parts.foreign_keys_preserved,
+            foreign_keys_added=parts.foreign_keys_added,
+            foreign_keys_removed=parts.foreign_keys_removed,
+            dependencies=parts.dependencies,
+            warnings=tuple(parts.warnings),
+            tmp_table=parts.tmp_table,
+            keep_table=parts.keep_table,
+        )
+
+    def _build_transform(
+        self,
         *,
         types: dict | None = None,
         rename: dict | None = None,
@@ -2786,9 +3079,11 @@ class Table(Queryable):
         tmp_suffix: str | None = None,
         keep_table: str | None = None,
         strict: bool | None = None,
-    ) -> list[str]:
+        deterministic_tmp_suffix: bool = False,
+    ) -> "_TransformParts":
         """
-        Return a list of SQL statements that should be executed in order to apply this transformation.
+        Build the validated parts of a transformation. Shared by
+        :meth:`transform`, :meth:`transform_sql` and :meth:`plan_transform`.
 
         :param types: Columns that should have their type changed, for example ``{"weight": float}``
         :param rename: Columns to rename, for example ``{"headline": "title"}``
@@ -2808,6 +3103,8 @@ class Table(Queryable):
           dropped
         :param strict: Set to ``True`` to make the table strict or ``False`` to make it
           non-strict. Defaults to ``None``, which preserves the existing strict mode.
+        :param deterministic_tmp_suffix: Use a fixed temporary table name suffix
+          instead of a random one, so the plan is byte-for-byte reproducible
         """
         if strict is True and not self.db.supports_strict:
             raise TransformError("SQLite does not support STRICT tables")
@@ -2818,6 +3115,24 @@ class Table(Queryable):
         # Resolve column references against the existing schema, matching
         # case-insensitively the way SQLite does
         existing_columns = self.columns_dict
+        # Generated columns are hidden from PRAGMA table_info, so read them
+        # from the stored CREATE TABLE statement and add them to the set of
+        # columns that callers may reference.
+        existing_generated: dict[str, GeneratedColumn] = {}
+        try:
+            existing_generated = parse_generated_columns(self.schema)
+            existing_checks = self.checks
+            existing_column_comments = parse_column_comments(self.schema)
+            existing_autoincrement = parse_autoincrement(self.schema)
+            existing_uniques = parse_uniques(self.schema)
+        except ParseError as ex:
+            raise TransformError(
+                f"Could not parse table schema for table {self.name!r}: {ex}"
+            ) from ex
+        for generated_name, generated_column in existing_generated.items():
+            existing_columns.setdefault(
+                generated_name, column_affinity(generated_column.declared_type)
+            )
         types = {resolve_casing(c, existing_columns): t for c, t in types.items()}
         rename = {resolve_casing(c, existing_columns): v for c, v in rename.items()}
         drop = {resolve_casing(c, existing_columns) for c in drop}
@@ -2840,15 +3155,33 @@ class Table(Queryable):
         if column_order is not None:
             column_order = [resolve_casing(c, existing_columns) for c in column_order]
 
-        try:
-            existing_checks = self.checks
-            existing_column_comments = parse_column_comments(self.schema)
-            existing_autoincrement = parse_autoincrement(self.schema)
-            existing_uniques = parse_uniques(self.schema)
-        except ParseError as ex:
-            raise TransformError(
-                f"Could not parse table schema for table {self.name!r}: {ex}"
-            ) from ex
+        for generated_name, generated_column in existing_generated.items():
+            if generated_column.collation:
+                raise TransformError(
+                    f"Cannot transform table {self.name!r}: generated column "
+                    f"{generated_name!r} uses a COLLATE clause, which cannot yet "
+                    "be recreated by transform(). Drop and recreate the table "
+                    "manually instead."
+                )
+            for dropped_column in drop:
+                if dropped_column != generated_name and check_references_identifier(
+                    generated_column.expression, dropped_column
+                ):
+                    raise TransformError(
+                        f"Cannot drop column {dropped_column!r}: it is used by "
+                        f"generated column {generated_name!r}"
+                    )
+        # Generated columns cannot be referenced by foreign keys or primary
+        # keys - reject those requests instead of generating invalid SQL.
+        generated_column_names = set(existing_generated)
+        pk_targets: tuple[Any, ...] = ()
+        if pk is not DEFAULT and pk is not None:
+            pk_targets = tuple(pk) if isinstance(pk, (list, tuple)) else (pk,)
+        for pk_target in pk_targets:
+            if pk_target in generated_column_names:
+                raise TransformError(
+                    f"Cannot use generated column {pk_target!r} as a primary key"
+                )
         create_table_checks: list[Check] = []
         for check in existing_checks:
             owner = (
@@ -2909,6 +3242,10 @@ class Table(Queryable):
                 create_table_column_comments[rename.get(owner) or owner] = comments
 
         create_table_foreign_keys: list[ForeignKeyIndicator] = []
+        foreign_keys_preserved: list[ForeignKey] = []
+        foreign_keys_added: list[ForeignKey] = []
+        foreign_keys_removed: list[ForeignKey] = []
+        existing_foreign_keys = list(self.foreign_keys)
 
         if foreign_keys is not None:
             if add_foreign_keys is not None:
@@ -2919,7 +3256,16 @@ class Table(Queryable):
                 raise ValueError(
                     "Cannot specify both foreign_keys and drop_foreign_keys"
                 )
-            create_table_foreign_keys.extend(foreign_keys)
+            resolved_new = self.db.resolve_foreign_keys(self.name, foreign_keys)
+            create_table_foreign_keys.extend(resolved_new)
+            for fk in existing_foreign_keys:
+                if fk not in resolved_new:
+                    foreign_keys_removed.append(fk)
+            for fk in resolved_new:
+                if fk in existing_foreign_keys:
+                    foreign_keys_preserved.append(fk)
+                elif fk not in foreign_keys_added:
+                    foreign_keys_added.append(fk)
         else:
             # Construct foreign_keys from current, plus add_foreign_keys, minus drop_foreign_keys
             # The casing of columns in a foreign key definition can differ
@@ -2978,18 +3324,50 @@ class Table(Queryable):
             create_table_foreign_keys = []
             # Copy over old foreign keys, unless we are dropping them
             for fk in self.foreign_keys:
-                if not fk_should_be_dropped(fk):
-                    create_table_foreign_keys.append(fk_with_renamed_columns(fk))
+                renamed_fk = fk_with_renamed_columns(fk)
+                if fk_should_be_dropped(fk):
+                    foreign_keys_removed.append(fk)
+                else:
+                    create_table_foreign_keys.append(renamed_fk)
+                    foreign_keys_preserved.append(renamed_fk)
             # Add new foreign keys
             if add_foreign_keys is not None:
+                old_signatures = {
+                    (fk.other_table, tuple(fk.other_columns), tuple(fk.columns))
+                    for fk in existing_foreign_keys
+                }
                 for fk in self.db.resolve_foreign_keys(self.name, add_foreign_keys):
-                    create_table_foreign_keys.append(fk_with_renamed_columns(fk))
+                    renamed_fk = fk_with_renamed_columns(fk)
+                    create_table_foreign_keys.append(renamed_fk)
+                    signature = (
+                        fk.other_table,
+                        tuple(fk.other_columns),
+                        tuple(
+                            renamed_columns_folded.get(fold_identifier_case(column))
+                            or column
+                            for column in fk.columns
+                        ),
+                    )
+                    if signature not in old_signatures:
+                        foreign_keys_added.append(renamed_fk)
 
-        new_table_name = f"{self.name}_new_{tmp_suffix or os.urandom(6).hex()}"
+        if tmp_suffix is not None:
+            new_table_name = f"{self.name}_new_{tmp_suffix}"
+        elif deterministic_tmp_suffix:
+            new_table_name = f"{self.name}_new"
+        else:
+            new_table_name = f"{self.name}_new_{os.urandom(6).hex()}"
         current_column_pairs = list(self.columns_dict.items())
         new_column_pairs = []
         copy_from_to = {column: column for column, _ in current_column_pairs}
+        # Generated columns are kept with a rewritten expression, but are not
+        # part of the INSERT ... SELECT data copy.
+        create_table_generated: dict[str, GeneratedColumn] = {}
+        for generated_name, generated_column in existing_generated.items():
+            copy_from_to.pop(generated_name, None)
+        type_change_map: dict[str, tuple[str, str]] = {}
         for name, type_ in current_column_pairs:
+            old_type = type_
             type_ = types.get(name) or type_
             if name in drop:
                 del copy_from_to[name]
@@ -2997,6 +3375,39 @@ class Table(Queryable):
             new_name = rename.get(name) or name
             new_column_pairs.append((new_name, type_))
             copy_from_to[name] = new_name
+            old_type_name = COLUMN_TYPE_MAPPING.get(old_type, str(old_type))
+            new_type_name = COLUMN_TYPE_MAPPING.get(type_, str(type_))
+            if old_type_name != new_type_name:
+                type_change_map[new_name] = (old_type_name, new_type_name)
+        for name, generated_column in existing_generated.items():
+            if name in drop:
+                continue
+            new_name = rename.get(name) or name
+            new_column_pairs.append(
+                (new_name, column_affinity(generated_column.declared_type))
+            )
+            expression = rewrite_check_expression(generated_column.expression, rename)
+            if name in types:
+                new_type = types[name]
+                declared_type = COLUMN_TYPE_MAPPING.get(
+                    new_type,
+                    new_type.upper() if isinstance(new_type, str) else str(new_type),
+                )
+            else:
+                declared_type = generated_column.declared_type
+            create_table_generated[new_name] = GeneratedColumn(
+                name=new_name,
+                declared_type=declared_type,
+                collation=generated_column.collation,
+                definition=(
+                    "GENERATED ALWAYS AS ({expression}) {storage}".format(
+                        expression=expression,
+                        storage="STORED" if generated_column.stored else "VIRTUAL",
+                    )
+                ),
+                expression=expression,
+                stored=generated_column.stored,
+            )
 
         if existing_autoincrement:
             existing_autoincrement = resolve_casing(
@@ -3042,6 +3453,27 @@ class Table(Queryable):
             if c.notnull
             if c.name not in drop
         }
+        # PRAGMA table_info omits generated columns; read their NOT NULL
+        # flags from PRAGMA table_xinfo instead (column 3 is notnull).
+        try:
+            xinfo_rows = self.db.execute(
+                f"PRAGMA table_xinfo({quote_identifier(self.name)})"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            xinfo_rows = cast(list, [])
+        for xinfo_row in xinfo_rows:
+            xinfo_name, xinfo_notnull, xinfo_hidden = (
+                xinfo_row[1],
+                xinfo_row[3],
+                xinfo_row[6],
+            )
+            if (
+                xinfo_hidden in (2, 3)
+                and xinfo_notnull
+                and xinfo_name in existing_generated
+                and xinfo_name not in drop
+            ):
+                create_table_not_null.add(rename.get(xinfo_name) or xinfo_name)
         if isinstance(not_null, dict):
             # Remove any columns with a value of False
             for key, value in not_null.items():
@@ -3088,6 +3520,7 @@ class Table(Queryable):
                 _column_comments=create_table_column_comments,
                 _autoincrement=create_table_autoincrement,
                 _uniques=create_table_uniques,
+                _generated=create_table_generated,
             ).strip()
         )
 
@@ -3115,6 +3548,36 @@ class Table(Queryable):
             new_cols.insert(0, "rowid")
             old_cols.insert(0, "rowid")
 
+        # Column mapping for the dry-run plan. Generated columns come first in
+        # new_column_pairs ordering is not significant here; report in the
+        # order the INSERT ... SELECT copies them, then the generated ones.
+        column_mappings = [
+            ColumnMapping(
+                destination=to_,
+                source=from_,
+                generated=False,
+                type_change=type_change_map.get(to_),
+            )
+            for from_, to_ in copy_from_to.items()
+        ]
+        for generated_name in create_table_generated:
+            column_mappings.append(
+                ColumnMapping(
+                    destination=generated_name,
+                    source=None,
+                    generated=True,
+                )
+            )
+        old_column_names = set(existing_columns)
+        old_destination_names = {
+            rename.get(name) or name for name in old_column_names if name not in drop
+        }
+        new_column_names = {mapping.destination for mapping in column_mappings}
+        dropped_columns = tuple(name for name in existing_columns if name in drop)
+        new_columns = tuple(
+            name for name in new_column_names if name not in old_destination_names
+        )
+
         def _copy_expr(col):
             if col in text_to_numeric_cols:
                 return "NULLIF({}, '')".format(quote_identifier(col))
@@ -3132,9 +3595,13 @@ class Table(Queryable):
         # metadata instead of editing their stored CREATE INDEX SQL.
         index_drop_sqls = []
         index_create_sqls = []
+        indexes_preserved: list[str] = []
+        indexes_rebuilt: list[str] = []
+        indexes_lost: list[str] = []
         xindexes_by_name = {index.name: index for index in self.xindexes}
         for index in self.indexes:
             if index.origin == "pk":
+                indexes_preserved.append(index.name)
                 continue
             index_sql = self.db.execute(
                 """SELECT sql FROM sqlite_master WHERE type = 'index' AND name = :index_name;""",
@@ -3143,6 +3610,7 @@ class Table(Queryable):
             if index_sql is None:
                 if index.origin == "u":
                     # UNIQUE constraints are reproduced in CREATE TABLE above.
+                    indexes_preserved.append(index.name)
                     continue
                 raise TransformError(
                     f"Index '{index.name}' on table '{self.name}' does not have a "
@@ -3167,12 +3635,36 @@ class Table(Queryable):
                 (column for column in xindex.columns if column.key),
                 key=lambda column: column.seqno,
             )
-            if (rename or drop) and (
-                index.partial or any(column.name is None for column in indexed_columns)
-            ):
+            # Partial (WHERE ...) and expression (lower(name), ...) indexes
+            # cannot be mechanically rewritten from PRAGMA metadata. They can
+            # be left untouched as long as none of the columns renamed or
+            # dropped here are referenced by the index's key columns or WHERE
+            # predicate; otherwise refuse with the original SQL for context.
+            is_complex_index = index.partial or any(
+                column.name is None for column in indexed_columns
+            )
+            renamed_complex_column = next(
+                (
+                    column
+                    for column in rename
+                    if check_references_identifier(index_sql, column)
+                ),
+                None,
+            )
+            dropped_complex_column = next(
+                (
+                    column
+                    for column in drop
+                    if check_references_identifier(index_sql, column)
+                ),
+                None,
+            )
+            if (renamed_complex_column or dropped_complex_column) and is_complex_index:
                 raise TransformError(
                     f"Index '{index.name}' is a partial or expression index, so it "
-                    f"cannot be safely recreated while columns are renamed or dropped. "
+                    f"cannot be safely recreated while column "
+                    f"{renamed_complex_column or dropped_complex_column!r} is "
+                    f"{'renamed' if renamed_complex_column else 'dropped'}. "
                     f"You must manually drop this index prior to running this transformation "
                     f"and manually recreate the new index after running this transformation. "
                     f"The original index sql statement is: `{index_sql}`. No changes have been applied to this table."
@@ -3203,7 +3695,100 @@ class Table(Queryable):
                     f"DROP INDEX IF EXISTS {quote_identifier(index.name)};"
                 )
             index_create_sqls.append(index_sql)
+            if renamed_index_column is not None:
+                indexes_rebuilt.append(index.name)
+            else:
+                indexes_preserved.append(index.name)
         sqls.extend(index_drop_sqls)
+        # Capture triggers before the old table is dropped. DROP TABLE removes
+        # every trigger attached to the table (including the FTS sync triggers
+        # created by enable_fts()), so each trigger is recreated after the
+        # swap. Trigger bodies that reference renamed columns are rewritten the
+        # same way CHECK expressions are.
+        triggers_rebuilt = []
+        triggers_lost = []
+        trigger_drop_sqls = []
+        trigger_create_sqls = []
+        for trigger in self.triggers:
+            if not trigger.sql:
+                triggers_lost.append(trigger.name)
+                continue
+            dropped_trigger_column = next(
+                (
+                    dropped_column
+                    for dropped_column in drop
+                    if check_references_identifier(trigger.sql, dropped_column)
+                ),
+                None,
+            )
+            if dropped_trigger_column is not None:
+                raise TransformError(
+                    f"Cannot drop column {dropped_trigger_column!r}: trigger "
+                    f"{trigger.name!r} references it. Drop or update the trigger "
+                    "before transforming. The original trigger SQL is: "
+                    f"`{trigger.sql}`. No changes have been applied to this table."
+                )
+            trigger_sql = trigger.sql
+            if rename:
+                trigger_sql = rewrite_check_expression(trigger_sql, rename)
+            if keep_table:
+                trigger_drop_sqls.append(
+                    f"DROP TRIGGER IF EXISTS {quote_identifier(trigger.name)};"
+                )
+            trigger_create_sqls.append(
+                trigger_sql if trigger_sql.endswith(";") else trigger_sql + ";"
+            )
+            triggers_rebuilt.append(trigger.name)
+        # FTS shadow tables - virtual FTS tables whose content table is this
+        # table. Renaming or dropping a column that the FTS index reads breaks
+        # its sync triggers, so refuse rather than leaving a broken index.
+        fts_dependencies = self._fts_dependencies()
+        dependency_names: list[str] = []
+        warnings: list[str] = []
+        for fts_table_name, fts_columns in fts_dependencies:
+            dependency_names.append(fts_table_name)
+            dependency_names.extend(
+                row[0]
+                for row in self.db.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    " AND name LIKE ? AND name != ?",
+                    (fts_table_name + "_%", fts_table_name),
+                ).fetchall()
+            )
+            dependency_names.extend(
+                trigger.name
+                for trigger in self.triggers
+                if fts_table_name in (trigger.sql or "")
+            )
+            for changed_column, action in ((column, "renamed") for column in rename):
+                if changed_column in fts_columns:
+                    raise TransformError(
+                        f"Cannot {action} column {changed_column!r}: it is indexed "
+                        f"by the FTS table {fts_table_name!r}. Run disable_fts() "
+                        "before transforming, then re-enable the index with "
+                        "enable_fts(). No changes have been applied to this table."
+                    )
+            for dropped_column in drop:
+                if dropped_column in fts_columns:
+                    raise TransformError(
+                        f"Cannot drop column {dropped_column!r}: it is indexed by "
+                        f"the FTS table {fts_table_name!r}. Run disable_fts() "
+                        "before transforming, then re-enable the index with "
+                        "enable_fts(). No changes have been applied to this table."
+                    )
+        for fts_table_name, _ in fts_dependencies:
+            warnings.append(
+                "FTS table {!r} and its shadow tables are attached to this "
+                "table; the rebuild recreates its sync triggers but the FTS "
+                "index itself is not rebuilt.".format(fts_table_name)
+            )
+        if keep_table and fts_dependencies:
+            warnings.append(
+                "keep_table={!r} keeps a copy of the old table, but FTS sync "
+                "triggers continue to populate the live table and cannot point "
+                "at the copy.".format(keep_table)
+            )
+        sqls.extend(trigger_drop_sqls)
         # Drop (or keep) the old table, then rename the new one into place.
         # Since SQLite 3.25 ALTER TABLE ... RENAME TO rewrites references to
         # the renamed table in every view definition, which fails if a view
@@ -3251,7 +3836,37 @@ class Table(Queryable):
             )
         # Re-add existing indexes
         sqls.extend(index_create_sqls)
-        return sqls
+        # Re-add existing triggers after the table has been swapped into place
+        sqls.extend(trigger_create_sqls)
+        # Deduplicate dependency names while preserving order
+        seen_dependencies: set[str] = set()
+
+        def _not_seen(name: str) -> bool:
+            if name in seen_dependencies:
+                return False
+            seen_dependencies.add(name)
+            return True
+
+        dependencies = tuple(name for name in dependency_names if _not_seen(name))
+        return _TransformParts(
+            tmp_table=new_table_name,
+            keep_table=keep_table,
+            sql_steps=sqls,
+            column_mappings=column_mappings,
+            dropped_columns=dropped_columns,
+            new_columns=new_columns,
+            indexes_preserved=tuple(indexes_preserved),
+            indexes_rebuilt=tuple(indexes_rebuilt),
+            indexes_lost=tuple(indexes_lost),
+            triggers_preserved=tuple(),
+            triggers_rebuilt=tuple(triggers_rebuilt),
+            triggers_lost=tuple(triggers_lost),
+            foreign_keys_preserved=tuple(foreign_keys_preserved),
+            foreign_keys_added=tuple(foreign_keys_added),
+            foreign_keys_removed=tuple(foreign_keys_removed),
+            dependencies=dependencies,
+            warnings=warnings,
+        )
 
     def extract(
         self,
@@ -3925,6 +4540,40 @@ class Table(Queryable):
             return None
         else:
             return rows[0][0]
+
+    def _fts_dependencies(self) -> list[tuple[str, tuple[str, ...]]]:
+        """
+        Return ``[(fts_table_name, indexed_columns)]`` for every FTS virtual
+        table (FTS4 or FTS5) whose content table is this table.
+        """
+        sql = textwrap.dedent("""
+            SELECT name FROM sqlite_master
+                WHERE type = 'table'
+                AND rootpage = 0
+                AND (
+                    sql LIKE :like
+                    OR sql LIKE :like2
+                    OR (
+                        tbl_name = :table
+                        AND sql LIKE '%VIRTUAL TABLE%USING FTS%'
+                    )
+                )
+        """).strip()
+        args = {
+            "like": f"%VIRTUAL TABLE%USING FTS%content=[{self.name}]%",
+            "like2": f'%VIRTUAL TABLE%USING FTS%content="{self.name}"%',
+            "table": self.name,
+        }
+        dependencies = []
+        for (fts_table_name,) in self.db.execute(sql, args).fetchall():
+            fts_columns = tuple(
+                row[1]
+                for row in self.db.execute(
+                    f"PRAGMA table_info({quote_identifier(fts_table_name)})"
+                ).fetchall()
+            )
+            dependencies.append((fts_table_name, fts_columns))
+        return dependencies
 
     def optimize(self) -> "Table":
         "Run the ``optimize`` operation against the associated full-text search index table."

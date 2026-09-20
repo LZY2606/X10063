@@ -1950,6 +1950,34 @@ def test_transform_sql(db_path):
     assert db.table("dogs").schema == original_schema
 
 
+def test_transform_plan_is_dry_run(db_path):
+    db = Database(db_path)
+    with db.conn:
+        db.table("dogs").insert({"id": 1, "age": 4, "name": "Cleo"}, pk="id")
+    original_schema = db.table("dogs").schema
+
+    result = CliRunner().invoke(
+        cli.cli,
+        ["transform", db_path, "dogs", "--rename", "name", "full_name", "--plan"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Transform plan for table 'dogs'" in result.output
+    assert "name -> full_name" in result.output
+    assert 'CREATE TABLE "dogs_new"' in result.output
+    # Nothing was executed
+    assert db.table("dogs").schema == original_schema
+    assert "full_name" not in db.table("dogs").schema
+
+
+def test_transform_plan_rejects_sql_flag(db_path):
+    result = CliRunner().invoke(
+        cli.cli, ["transform", db_path, "Gosh", "--plan", "--sql"]
+    )
+    assert result.exit_code != 0
+    assert "--plan and --sql" in result.output
+
+
 @pytest.mark.parametrize(
     "initial_strict,args,expected_strict",
     (

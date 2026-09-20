@@ -511,6 +511,8 @@ See :ref:`cli_transform_table`.
       --strict / --no-strict          Enable or disable STRICT mode (default:
                                       preserve current mode)
       --sql                           Output SQL without executing it
+      --plan                          Output a detailed dry-run plan without
+                                      executing it
       --load-extension TEXT           Path to SQLite extension, with optional
                                       :entrypoint
       -h, --help                      Show this message and exit.

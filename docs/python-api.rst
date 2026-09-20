@@ -2028,14 +2028,61 @@ To achieve this, the SQL produced by ``transform_sql()`` turns on ``PRAGMA legac
 
 .. _python_api_transform_sql:
 
+Dry-run plans with .plan_transform()
+------------------------------------
+
+The ``table.plan_transform(...)`` method takes the same arguments as ``table.transform(...)`` but returns a :ref:`TransformPlan <reference_db_other_transform_plan>` object instead of changing anything. Building a plan performs every validation that ``transform()`` performs but writes nothing to the database, and two plans built from the same schema and arguments are byte-for-byte identical.
+
+The plan describes the full impact of the operation:
+
+- ``plan.sql_steps`` is the ordered list of SQL statements (also available joined together as ``plan.sql``) - these are exactly the statements ``transform()`` runs
+- ``plan.columns`` lists a :ref:`ColumnMapping <reference_db_other_column_mapping>` for every output column, showing how each is populated, any rename and any type change
+- ``plan.dropped_columns`` and ``plan.new_columns`` list removed and added columns
+- ``plan.indexes_preserved``, ``plan.indexes_rebuilt`` and ``plan.indexes_lost`` describe index handling
+- ``plan.triggers_preserved``, ``plan.triggers_rebuilt`` and ``plan.triggers_lost`` describe trigger handling
+- ``plan.foreign_keys_preserved``, ``plan.foreign_keys_added`` and ``plan.foreign_keys_removed`` describe foreign key handling, including composite keys
+- ``plan.dependencies`` lists related objects such as FTS shadow tables, and ``plan.warnings`` carries any cautions
+
+.. code-block:: python
+
+    plan = db["authors"].plan_transform(types={"id": str}, rename={"name": "full_name"})
+    print(plan)
+
+A plan can be executed later - the statements run are exactly the ones the plan described:
+
+.. code-block:: python
+
+    plan = db["authors"].plan_transform(types={"id": str})
+    # ... review the plan ...
+    db["authors"].transform(plan=plan)
+
+Passing ``plan=`` together with any other transform argument raises ``ValueError``, and a plan built for one table cannot be executed against a differently-named table.
+
+The ``sqlite-utils transform`` command accepts ``--plan`` to print this plan without executing it, and ``--sql`` continues to print just the SQL statements.
+
+Atomic execution
+----------------
+
+Every statement of a transform - creating the replacement table, copying the rows, swapping the tables and recreating indexes and triggers - runs inside one transaction. If any step fails, for example a ``NOT NULL`` constraint while the data is copied, the whole transaction is rolled back and the original table, its rows, indexes and triggers are left exactly as they were.
+
+Indexes, triggers and generated columns
+---------------------------------------
+
+``.transform()`` recreates indexes and triggers on the rebuilt table. Simple indexes that reference renamed columns are rebuilt with the new column names. Partial and expression indexes are left untouched when unrelated columns change, but renaming or dropping a column they reference raises ``TransformError`` rather than silently breaking the index. Triggers are recreated with their original SQL, with references to renamed columns rewritten; dropping a column a trigger references raises ``TransformError``.
+
+Generated (``GENERATED ALWAYS AS`` / ``AS (...)``) columns are preserved across the rebuild, including ``VIRTUAL`` and ``STORED`` storage, ``NOT NULL`` and ``CHECK`` constraints, and references to renamed columns in their expressions are rewritten. Dropping a column used by a generated-column expression raises ``TransformError``.
+
+FTS shadow tables
+-----------------
+
+When the table is the content table of an FTS4 or FTS5 index, ``plan.dependencies`` reports the FTS table, its shadow tables and its sync triggers. Renaming or dropping a column indexed by FTS raises ``TransformError`` (run ``disable_fts()`` first and re-enable the index afterwards); transforms that leave the indexed columns alone recreate the sync triggers and keep the index working.
+
 Custom transformations with .transform_sql()
 --------------------------------------------
 
-The ``.transform()`` method can handle most cases, but it does not automatically upgrade indexes, views or triggers associated with the table that is being transformed.
-
 If you want to do something more advanced, you can call the ``table.transform_sql(...)`` method with the same arguments that you would have passed to ``table.transform(...)``.
 
-This method will return a list of SQL statements that should be executed to implement the change. You can then make modifications to that SQL - or add additional SQL statements - before executing it yourself.
+This method will return the list of SQL statements that ``transform()`` would execute. Unlike ``plan_transform()`` it uses a random temporary-table suffix by default (pass ``tmp_suffix=`` to control it). You can make modifications to that SQL - or add additional SQL statements - before executing it yourself. Note that view definitions are still left unchanged, as described below.
 
 .. _python_api_transform_foreign_keys_transactions:
 

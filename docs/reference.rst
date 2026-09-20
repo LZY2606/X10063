@@ -77,6 +77,20 @@ sqlite_utils.db.ForeignKey
 
 .. autoclass:: sqlite_utils.db.ForeignKey
 
+.. _reference_db_other_column_mapping:
+
+sqlite_utils.db.ColumnMapping
+-----------------------------
+
+.. autoclass:: sqlite_utils.db.ColumnMapping
+
+.. _reference_db_other_transform_plan:
+
+sqlite_utils.db.TransformPlan
+-----------------------------
+
+.. autoclass:: sqlite_utils.db.TransformPlan
+
 sqlite_utils.utils
 ==================
 

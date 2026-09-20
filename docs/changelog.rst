@@ -4,6 +4,15 @@
  Changelog
 ===========
 
+.. _v4_2_2:
+
+4.2.2 (unreleased)
+------------------
+
+- New ``table.plan_transform(...)`` returns a ``TransformPlan`` describing the SQL steps, column mapping, index/trigger retention and foreign key handling of a transform without writing anything; plans are byte-for-byte reproducible. ``table.transform(plan=...)`` executes such a plan, and ``sqlite-utils transform --plan`` shows one from the CLI.
+- ``table.transform()`` now preserves generated columns (including their expressions, ``NOT NULL``/``CHECK`` constraints and ``VIRTUAL``/``STORED`` storage) and recreates triggers after the table rebuild, and reports FTS shadow-table dependencies. Renaming or dropping a column referenced by a generated-column expression, a trigger or an FTS index raises ``TransformError`` with diagnostic context.
+- Partial and expression indexes are now preserved when the transform does not touch the columns they reference.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

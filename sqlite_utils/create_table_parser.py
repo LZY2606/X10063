@@ -39,6 +39,27 @@ class UniqueColumn:
     order: str = ""
 
 
+@dataclass(frozen=True)
+class GeneratedColumn:
+    """
+    A ``GENERATED ALWAYS AS (...)`` column parsed from a CREATE TABLE statement.
+
+    ``name`` is the unquoted column name, ``declared_type`` is the optional
+    declared type (such as ``"TEXT"``) and ``definition`` is the full column
+    definition starting at ``GENERATED``/``AS`` - for example
+    ``"GENERATED ALWAYS AS (upper(a)) VIRTUAL"``. ``expression`` holds just the
+    expression inside the required parentheses and ``stored`` is True for
+    STORED columns and False for VIRTUAL columns.
+    """
+
+    name: str
+    declared_type: str
+    collation: str
+    definition: str
+    expression: str
+    stored: bool
+
+
 @dataclass
 class Unique:
     columns: tuple[UniqueColumn, ...]
@@ -608,6 +629,113 @@ def parse_autoincrement(create_sql: str) -> str | None:
                 return column
             index += 1
     return None
+
+
+def parse_generated_columns(create_sql: str) -> dict[str, "GeneratedColumn"]:
+    """
+    Return ``{column_name: GeneratedColumn}`` for the generated
+    (``GENERATED ALWAYS AS`` / ``AS (...)``) columns in a CREATE TABLE statement.
+
+    The search for the ``AS`` keyword stays outside of parentheses, so an
+    ordinary column whose type or default expression contains the word ``AS``
+    (inside a CASE expression, for example) is not misidentified.
+    """
+    body_info = _table_body(create_sql)
+    if body_info is None:
+        return {}
+    body, _ = body_info
+    generated: dict[str, GeneratedColumn] = {}
+    for item, _, _ in _split_spans(body, _lex(body)):
+        item_tokens = _meaningful(_lex(item))
+        if not item_tokens:
+            continue
+        head = item_tokens[0]
+        if (
+            head.kind == "word" and head.text.upper() in _TABLE_CONSTRAINT_KEYWORDS
+        ) or head.is_keyword("CONSTRAINT"):
+            continue
+        column = _unquote(head.text)
+        # Find a depth-zero AS keyword - the parentheses around the generated
+        # expression are mandatory in SQLite, so AS must be followed by "(".
+        depth = 0
+        as_index: int | None = None
+        index = 1
+        while index < len(item_tokens):
+            token = item_tokens[index]
+            if token.text == "(":
+                depth += 1
+                index += 1
+                continue
+            if token.text == ")" and depth:
+                depth -= 1
+                index += 1
+                continue
+            if depth == 0 and token.is_keyword("AS"):
+                next_token = (
+                    item_tokens[index + 1] if index + 1 < len(item_tokens) else None
+                )
+                if next_token is not None and next_token.text == "(":
+                    as_index = index
+                    break
+            index += 1
+        if as_index is None:
+            continue
+        open_paren = item_tokens[as_index + 1]
+        close_token_index = _matching_paren(item_tokens, as_index + 1)
+        close_token = item_tokens[close_token_index]
+        expression = item[open_paren.end : close_token.start].strip()
+        # Optional VIRTUAL (the default) or STORED keyword follows the parens
+        stored = False
+        tail_tokens = item_tokens[close_token_index + 1 :]
+        meaningful_tail = [
+            token
+            for token in tail_tokens
+            if token.text.upper() in ("VIRTUAL", "STORED")
+        ]
+        if meaningful_tail:
+            storage_token = meaningful_tail[0]
+            stored = storage_token.text.upper() == "STORED"
+        # Declared type, if any, is the text between the column name and the
+        # first column-constraint keyword or the GENERATED/AS keyword. Parenthesised
+        # type names such as VARCHAR(10) are skipped using parenthesis depth.
+        depth = 0
+        type_last_index = 0
+        for candidate_index in range(1, as_index):
+            candidate = item_tokens[candidate_index]
+            if candidate.text == "(":
+                depth += 1
+            elif candidate.text == ")":
+                depth -= 1
+            if depth > 0 or candidate.text in ("(", ")"):
+                type_last_index = candidate_index
+            else:
+                if candidate.text.upper() in _OTHER_COLUMN_CONSTRAINT_KEYWORDS:
+                    break
+                type_last_index = candidate_index
+        declared_type = (
+            item[item_tokens[1].start : item_tokens[type_last_index].end].strip()
+            if type_last_index
+            else ""
+        )
+        collation = ""
+        for candidate_index in range(1, as_index):
+            candidate = item_tokens[candidate_index]
+            if candidate.is_keyword("COLLATE") and candidate_index + 1 < as_index:
+                collation = _unquote(item_tokens[candidate_index + 1].text)
+                break
+        # Canonical clause - transform() reformats the schema anyway
+        definition = "GENERATED ALWAYS AS ({expression}) {storage}".format(
+            expression=expression, storage="STORED" if stored else "VIRTUAL"
+        )
+        generated[column] = GeneratedColumn(
+            name=column,
+            declared_type=declared_type,
+            collation=collation,
+            definition=definition,
+            expression=expression,
+            stored=stored,
+        )
+    return generated
 
 
 _CONFLICT_ACTIONS = frozenset(("ROLLBACK", "ABORT", "FAIL", "IGNORE", "REPLACE"))

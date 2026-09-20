@@ -2725,6 +2725,11 @@ def schema(
     help="Enable or disable STRICT mode (default: preserve current mode)",
 )
 @click.option("--sql", is_flag=True, help="Output SQL without executing it")
+@click.option(
+    "--plan",
+    is_flag=True,
+    help="Output a detailed dry-run plan without executing it",
+)
 @load_extension_option
 def transform(
     path,
@@ -2743,6 +2748,7 @@ def transform(
     drop_foreign_keys,
     strict,
     sql,
+    plan,
     load_extension,
 ):
     """Transform a table beyond the capabilities of ALTER TABLE
@@ -2792,33 +2798,29 @@ def transform(
         pk_value = None
 
     table_obj = db.table(table)
-    if sql:
+    transform_kwargs = dict(
+        types=types,
+        drop=drop_set,
+        rename=rename_dict,
+        column_order=column_order_list,
+        not_null=not_null_dict,
+        pk=pk_value,
+        defaults=default_dict,
+        drop_foreign_keys=drop_foreign_keys_value,
+        add_foreign_keys=add_foreign_keys_value,
+        strict=strict,
+    )
+    if plan:
+        if sql:
+            raise click.ClickException("--plan and --sql cannot be used together")
+        click.echo(table_obj.plan_transform(**transform_kwargs))
+    elif sql:
         for line in table_obj.transform_sql(
-            types=types,
-            drop=drop_set,
-            rename=rename_dict,
-            column_order=column_order_list,
-            not_null=not_null_dict,
-            pk=pk_value,
-            defaults=default_dict,
-            drop_foreign_keys=drop_foreign_keys_value,
-            add_foreign_keys=add_foreign_keys_value,
-            strict=strict,
+            **transform_kwargs,
         ):
             click.echo(line)
     else:
-        table_obj.transform(
-            types=types,
-            drop=drop_set,
-            rename=rename_dict,
-            column_order=column_order_list,
-            not_null=not_null_dict,
-            pk=pk_value,
-            defaults=default_dict,
-            drop_foreign_keys=drop_foreign_keys_value,
-            add_foreign_keys=add_foreign_keys_value,
-            strict=strict,
-        )
+        table_obj.transform(**transform_kwargs)
 
 
 @cli.command()
