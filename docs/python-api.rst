@@ -1814,6 +1814,40 @@ This method raises a ``sqlite_utils.db.TransformError`` exception if the table c
 .. note::
     In the CLI: :ref:`sqlite-utils transform <cli_transform_table>`
 
+.. _python_api_plan_transform:
+
+Planning a transform
+--------------------
+
+Sometimes you want to see exactly what a transform will do before it runs. The ``table.plan_transform()`` method takes the same arguments as ``.transform()`` but returns a ``TransformPlan`` object without writing anything:
+
+.. code-block:: python
+
+    plan = table.plan_transform(rename={"headline": "title"})
+    for step in plan.steps:
+        print(step.index, step.description)
+        print(step.sql)
+
+Planning only reads the schema - it performs no writes, so running it twice against the same schema and arguments produces an identical plan (the temporary table is always named ``<table>_new_plan``).
+
+The plan exposes the full impact of the change:
+
+- ``plan.columns_before`` / ``plan.columns_after`` describe every column, including ``GENERATED ALWAYS AS`` columns.
+- ``plan.column_mapping`` is a per-column record: whether the column is dropped or renamed, whether its values are copied or recomputed (generated columns are never copied) and the exact ``SELECT`` expression used for the copy.
+- ``plan.indexes`` and ``plan.triggers`` list every index and trigger on the table, with a ``kept`` flag, the ``CREATE`` statement that will recreate it, and - for triggers that cannot be safely rebuilt - a diagnostic ``reason`` plus the ``original_sql`` to rebuild by hand.
+- ``plan.foreign_keys`` and ``plan.foreign_keys_dropped`` describe the foreign keys on the rebuilt table (including composite foreign keys) and the constraints that will disappear.
+- ``plan.fts_virtual_tables`` / ``plan.fts_shadow_tables`` warn about FTS indexes tied to the table; ``plan.warnings`` collects human-readable notes.
+- ``plan.disables_foreign_keys`` / ``plan.defers_foreign_keys`` report the foreign-key handling the execution needs.
+
+Call ``plan.execute()`` to apply the plan. Execution is atomic: every step runs in a transaction and a failure at any point - while creating the replacement table, copying the data, swapping the tables or recreating indexes and triggers - rolls the database back to the original table:
+
+.. code-block:: python
+
+    plan = table.plan_transform(types={"age": int})
+    plan.execute()
+
+``print(plan)`` (or ``sqlite-utils transform ... --plan`` in the CLI) renders the annotated SQL and the columns, indexes and triggers that will be lost.
+
 .. _python_api_transform_alter_column_types:
 
 Altering column types

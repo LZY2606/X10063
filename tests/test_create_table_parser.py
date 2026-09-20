@@ -241,3 +241,98 @@ def test_check_like_text_inside_strings_is_opaque(value):
     assert len(checks) == 1
     assert checks[0].column == "value"
     assert checks[0].check == f"value != '{value}'"
+
+
+def test_parse_generated_columns_virtual_stored_and_shorthand():
+    from sqlite_utils.create_table_parser import parse_generated_columns
+
+    sql = """
+        CREATE TABLE g (
+            id INTEGER PRIMARY KEY,
+            first TEXT,
+            full TEXT GENERATED ALWAYS AS (first || ' ' || last) VIRTUAL,
+            doubled INTEGER AS (id * 2) STORED,
+            bare AS (id + 1),
+            CHECK (id > 0)
+        )
+    """
+    generated = parse_generated_columns(sql)
+    assert set(generated) == {"full", "doubled", "bare"}
+    assert generated["full"].declared_type == "TEXT"
+    assert generated["full"].expression == "first || ' ' || last"
+    assert generated["full"].storage == "VIRTUAL"
+    assert generated["doubled"].declared_type == "INTEGER"
+    assert generated["doubled"].expression == "id * 2"
+    assert generated["doubled"].storage == "STORED"
+    assert generated["bare"].declared_type == ""
+    assert generated["bare"].storage == "VIRTUAL"
+    assert generated["bare"].clause.startswith("AS (id + 1)")
+
+
+def test_parse_generated_columns_empty_for_plain_table():
+    from sqlite_utils.create_table_parser import parse_generated_columns
+
+    assert parse_generated_columns(
+        "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)"
+    ) == {}
+
+
+def test_plan_trigger_sql_qualified_rename_and_drop():
+    from sqlite_utils.create_table_parser import plan_trigger_sql
+
+    sql = (
+        "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN "
+        "INSERT INTO logs(msg) VALUES (new.name || old.name); END;"
+    )
+    rewritten = plan_trigger_sql(sql, "t", rename={"name": "full_name"})
+    assert rewritten.recreate is True
+    assert "new.full_name" in rewritten.sql
+    assert "old.full_name" in rewritten.sql
+    dropped = plan_trigger_sql(sql, "t", drop={"name"})
+    assert dropped.recreate is False
+    assert "dropped column 'name'" in dropped.reason
+
+
+def test_plan_trigger_sql_quoted_qualified_and_verbatim():
+    from sqlite_utils.create_table_parser import plan_trigger_sql
+
+    sql = 'CREATE TRIGGER "a_ai" AFTER INSERT ON "a" BEGIN INSERT INTO "a_fts" ("body") VALUES (new."body"); END;'
+    rewritten = plan_trigger_sql(sql, "a", rename={"body": "body2"})
+    assert rewritten.recreate is True
+    assert 'new."body2"' in rewritten.sql
+    verbatim = plan_trigger_sql(sql, "a")
+    assert verbatim.recreate is True
+    assert verbatim.sql == sql
+
+
+def test_plan_trigger_sql_bare_rename_in_when_is_not_rewritten():
+    from sqlite_utils.create_table_parser import plan_trigger_sql
+
+    sql = (
+        "CREATE TRIGGER t_ai AFTER INSERT ON t WHEN name IS NOT NULL "
+        "BEGIN INSERT INTO logs(x) VALUES(1); END;"
+    )
+    result = plan_trigger_sql(sql, "t", rename={"name": "full_name"})
+    assert result.recreate is False
+    assert "NEW./OLD." in result.reason
+
+
+def test_plan_trigger_sql_self_update_set_is_rewritten():
+    from sqlite_utils.create_table_parser import plan_trigger_sql
+
+    sql = (
+        "CREATE TRIGGER t_ai AFTER INSERT ON t "
+        "BEGIN UPDATE t SET name = upper(new.name); END;"
+    )
+    result = plan_trigger_sql(sql, "t", rename={"name": "full_name"})
+    assert result.recreate is True
+    assert "SET full_name = upper(new.full_name)" in result.sql
+
+
+def test_plan_trigger_sql_external_update_set_target_ignored():
+    from sqlite_utils.create_table_parser import plan_trigger_sql
+
+    sql = "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN UPDATE other SET name = 'x'; END;"
+    result = plan_trigger_sql(sql, "t", rename={"name": "full_name"})
+    assert result.recreate is True
+    assert "full_name" not in result.sql

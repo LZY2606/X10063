@@ -9,7 +9,7 @@ reported instead of being silently under-parsed.
 
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 
 @dataclass
@@ -48,6 +48,19 @@ class Unique:
     sql: str = field(default="", compare=False, repr=False)
     start: int = field(default=-1, compare=False, repr=False)
     end: int = field(default=-1, compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class GeneratedColumn:
+    """A ``GENERATED ALWAYS AS (...)`` column parsed from a CREATE TABLE."""
+
+    name: str
+    declared_type: str
+    expression: str
+    storage: str  # "VIRTUAL" (the SQLite default) or "STORED"
+    # Full trailing clause, starting at GENERATED/AS and excluding trivia, so
+    # the column can be re-emitted without guessing at option order.
+    clause: str
 
 
 class ParseError(ValueError):
@@ -125,7 +138,6 @@ _SQLITE_KEYWORDS = frozenset(
         "FAIL",
         "FALSE",
         "FILTER",
-        "FIRST",
         "FOLLOWING",
         "FOR",
         "FOREIGN",
@@ -152,7 +164,6 @@ _SQLITE_KEYWORDS = frozenset(
         "ISNULL",
         "JOIN",
         "KEY",
-        "LAST",
         "LEFT",
         "LIKE",
         "LIMIT",
@@ -876,6 +887,16 @@ def _quote_replacement(original: str, replacement: str) -> str:
     return '"{}"'.format(replacement.replace('"', '""'))
 
 
+def _quote_if_bare(token_text: str, replacement: str) -> str:
+    # Rewriting NEW./OLD. references normalizes a bare source column to a
+    # quoted destination column, which is always valid.
+    if token_text.startswith(('"', "`")) or token_text.startswith("["):
+        return _quote_replacement(token_text, replacement)
+    if _valid_bare_identifier(replacement):
+        return replacement
+    return '"{}"'.format(replacement.replace('"', '""'))
+
+
 def rewrite_check_expression(expression: str, rename: dict[str, str]) -> str:
     """Rewrite column identifiers in a CHECK expression, preserving trivia."""
     if not rename:
@@ -895,3 +916,378 @@ def rewrite_check_expression(expression: str, rename: dict[str, str]) -> str:
     for start, end, replacement in reversed(edits):
         expression = expression[:start] + replacement + expression[end:]
     return expression
+
+
+_GENERATED_TYPE_STOPWORDS = frozenset(
+    (
+        "CONSTRAINT",
+        "PRIMARY",
+        "NOT",
+        "NULL",
+        "UNIQUE",
+        "CHECK",
+        "DEFAULT",
+        "COLLATE",
+        "REFERENCES",
+        "GENERATED",
+        "AS",
+    )
+)
+_GENERATED_STORAGE = frozenset(("VIRTUAL", "STORED"))
+
+
+def parse_generated_columns(create_sql: str) -> dict[str, GeneratedColumn]:
+    """
+    Return generated column definitions keyed by column name from a CREATE TABLE.
+
+    Both ``"c" AS (expr)`` and ``"c" TYPE GENERATED ALWAYS AS (expr) STORED``
+    forms are supported. Raises :class:`ParseError` for malformed generated
+    column syntax.
+    """
+    body_info = _table_body(create_sql)
+    if body_info is None:
+        return {}
+    body, _ = body_info
+    generated: dict[str, GeneratedColumn] = {}
+    for item, _, _ in _split_spans(body, _lex(body)):
+        tokens = _meaningful(_lex(item))
+        if not tokens:
+            continue
+        index = 0
+        if tokens[index].is_keyword("CONSTRAINT"):
+            index += 2
+        if index >= len(tokens):
+            continue
+        head = tokens[index]
+        if head.kind == "word" and head.text.upper() in _TABLE_CONSTRAINT_KEYWORDS:
+            continue
+        column = _unquote(head.text)
+        index += 1
+        # Optional declared type (which may itself contain parentheses, e.g.
+        # VARCHAR(255)). Stop at the first top-level constraint keyword.
+        type_tokens: list[_Token] = []
+        while index < len(tokens):
+            token = tokens[index]
+            if token.text == "(":
+                close = _matching_paren(tokens, index)
+                type_tokens.extend(tokens[index : close + 1])
+                index = close + 1
+                continue
+            if token.kind == "word" and token.text.upper() in _GENERATED_TYPE_STOPWORDS:
+                break
+            if token.kind == "identifier":
+                break
+            type_tokens.append(token)
+            index += 1
+        declared_type = "".join(token.text for token in type_tokens).strip()
+        clause_start_index = index
+        as_index = None
+        for candidate in range(index, len(tokens)):
+            if tokens[candidate].is_keyword("AS"):
+                as_index = candidate
+                break
+            if tokens[candidate].kind == "word" and tokens[
+                candidate
+            ].text.upper() not in ("GENERATED", "ALWAYS"):
+                break
+        if as_index is None:
+            continue
+        if as_index + 1 >= len(tokens) or tokens[as_index + 1].text != "(":
+            raise ParseError(
+                f"Generated column {column!r}: AS must be followed by a parenthesized expression"
+            )
+        expression_open = as_index + 1
+        expression_close = _matching_paren(tokens, expression_open)
+        expression = item[
+            tokens[expression_open].end : tokens[expression_close].start
+        ].strip()
+        storage = "VIRTUAL"
+        for token in tokens[expression_close + 1 :]:
+            if token.kind == "word" and token.text.upper() in _GENERATED_STORAGE:
+                storage = token.text.upper()
+                break
+        clause = item[tokens[clause_start_index].start :].strip()
+        generated[column] = GeneratedColumn(
+            name=column,
+            declared_type=declared_type,
+            expression=expression,
+            storage=storage,
+            clause=clause,
+        )
+    return generated
+
+
+@dataclass(frozen=True)
+class TriggerRewrite:
+    """
+    The result of planning how a CREATE TRIGGER statement survives a rebuild.
+
+    ``recreate`` is True when ``sql`` can be executed against the replacement
+    table (verbatim or with ``NEW.``/``OLD.`` column references rewritten).
+    Otherwise ``reason`` explains why the trigger will be lost and must be
+    recreated manually.
+    """
+
+    recreate: bool
+    sql: str = ""
+    reason: str = ""
+    referenced_columns: tuple[str, ...] = ()
+
+
+_TABLE_INTRODUCING_KEYWORDS = frozenset(("FROM", "JOIN", "INTO", "UPDATE"))
+
+
+def _trigger_regions(
+    tokens: list[_Token], table_name: str
+) -> tuple[int, tuple[int, int], tuple[int, int]]:
+    """
+    Return ``(on_table_index, when_span, body_span)`` for a CREATE TRIGGER.
+
+    The WHEN span covers the optional WHEN expression (only bare and
+    ``NEW.``/``OLD.``-qualified column references live there); the body span
+    covers BEGIN...END, where table references are also scanned. The
+    ``UPDATE OF <columns>`` list in the header is intentionally excluded.
+    """
+    begin_index = None
+    for index, token in enumerate(tokens):
+        if token.is_keyword("BEGIN"):
+            begin_index = index
+            break
+    if begin_index is None:
+        raise ParseError("CREATE TRIGGER statement is missing BEGIN")
+    end_index = None
+    for index in range(begin_index + 1, len(tokens)):
+        if tokens[index].is_keyword("END"):
+            end_index = index
+            break
+    if end_index is None:
+        raise ParseError("CREATE TRIGGER statement is missing END")
+    on_index = None
+    for index in range(begin_index):
+        token = tokens[index]
+        if not token.is_keyword("ON"):
+            continue
+        if index + 1 >= len(tokens):
+            continue
+        following = tokens[index + 1]
+        if following.kind in ("identifier", "word"):
+            name = following.text
+            if following.kind == "identifier":
+                name = _unquote(name)
+            if _ascii_fold(name) == _ascii_fold(table_name):
+                on_index = index
+                break
+    if on_index is None:
+        raise ParseError(
+            f"Could not find ON {table_name!r} clause in CREATE TRIGGER statement"
+        )
+    # A trailing FOR EACH ROW may sit between ON and WHEN/BEGIN.
+    when_span: tuple[int, int] = (-1, -1)
+    scan = on_index + 2
+    if scan < begin_index and tokens[scan].is_keyword("WHEN"):
+        when_span = (scan + 1, begin_index)
+    return on_index + 1, when_span, (begin_index + 1, end_index)
+
+
+def plan_trigger_sql(
+    sql: str,
+    table_name: str,
+    rename: dict[str, str] | None = None,
+    drop: Iterable[str] | None = None,
+) -> TriggerRewrite:
+    """
+    Decide how a trigger on ``table_name`` survives a transform.
+
+    With no columns renamed or dropped the trigger is recreated verbatim.
+    ``NEW."col"``/``OLD."col"`` references to renamed columns are rewritten.
+    A trigger that references a dropped column (qualified or not), or that
+    references a renamed column through an unqualified identifier (which
+    cannot be mechanically distinguished from a function name or a column of
+    another table), cannot be recreated safely and is reported with a
+    diagnostic reason instead. Such cases - common for hand-written triggers -
+    must be dropped and recreated by hand.
+    """
+    rename = rename or {}
+    drop_set = {fold for fold in (_ascii_fold(column) for column in (drop or ()))}
+    rename_folded = {_ascii_fold(key): value for key, value in rename.items()}
+    all_tokens = _lex(sql)
+    tokens = _meaningful(all_tokens)
+    if not tokens or not tokens[0].is_keyword("CREATE"):
+        raise ParseError("Expected a CREATE TRIGGER statement")
+    _, when_span, body_span = _trigger_regions(tokens, table_name)
+
+    referenced: set[str] = set()
+    edits: list[tuple[int, int, str]] = []
+    dropped_refs: list[str] = []
+    bare_renamed: list[str] = []
+    referenced_tables: set[str] = set()
+
+    def _update_set_target_table(region: list[_Token], inner_index: int) -> str | None:
+        """Name of the table whose column a top-level UPDATE ... SET targets."""
+        depth = 0
+        for back in range(inner_index - 1, -1, -1):
+            token = region[back]
+            if token.text == ")":
+                depth += 1
+            elif token.text == "(":
+                depth -= 1
+                if depth < 0:
+                    return None
+            if depth == 0 and token.is_keyword("SET"):
+                # SET belongs to the nearest preceding UPDATE; commas after
+                # SET stay in the same clause. Any clause keyword aborts the
+                # assignment list, so tokens after WHERE/ON/etc are not
+                # assignment targets even if an earlier SET exists.
+                for further in range(inner_index - 1, back, -1):
+                    earlier = region[further]
+                    if earlier.kind == "word" and earlier.text.upper() in (
+                        "WHERE",
+                        "ON",
+                        "WHEN",
+                        "FROM",
+                    ):
+                        return None
+                # Find "UPDATE <name>" preceding this SET clause
+                for further in range(back - 1, -1, -1):
+                    earlier = region[further]
+                    if earlier.is_keyword("UPDATE"):
+                        target_token = region[further + 1]
+                        return (
+                            _unquote(target_token.text)
+                            if target_token.kind == "identifier"
+                            else target_token.text
+                        )
+        return None
+
+    def _scan(region: list[_Token], offset: int, allow_tables: bool) -> None:
+        for inner_index, token in enumerate(region):
+            previous = region[inner_index - 1] if inner_index else None
+            paren_depth = sum(1 for t in region[:inner_index] if t.text == "(") - sum(
+                1 for t in region[:inner_index] if t.text == ")"
+            )
+            update_target = (
+                _update_set_target_table(region, inner_index)
+                if allow_tables and paren_depth == 0
+                else None
+            )
+            in_own_update_set = update_target is not None and _ascii_fold(
+                update_target
+            ) == _ascii_fold(table_name)
+            if (
+                allow_tables
+                and previous is not None
+                and previous.kind == "word"
+                and previous.text.upper() in _TABLE_INTRODUCING_KEYWORDS
+                and token.kind in ("identifier", "word")
+                and not (
+                    # FROM ( ... ) is a subquery, not a table name;
+                    # INTO <table> ( ... ) names the table before its
+                    # column list and must still be captured.
+                    previous.text.upper() == "FROM"
+                    and (
+                        inner_index + 1 < len(region)
+                        and region[inner_index + 1].text == "("
+                    )
+                )
+            ):
+                name_token = token
+                if (
+                    inner_index + 2 < len(region)
+                    and region[inner_index + 1].text == "."
+                    and region[inner_index + 2].kind in ("identifier", "word")
+                ):
+                    name_token = region[inner_index + 2]
+                referenced_tables.add(
+                    _unquote(name_token.text)
+                    if name_token.kind == "identifier"
+                    else name_token.text
+                )
+            if not _is_identifier_token(region, inner_index):
+                continue
+            name = _unquote(token.text) if token.kind == "identifier" else token.text
+            folded = _ascii_fold(name)
+            qualified = (
+                inner_index >= 2
+                and region[inner_index - 1].text == "."
+                and region[inner_index - 2].kind == "word"
+                and region[inner_index - 2].text.upper() in ("NEW", "OLD")
+            )
+            if qualified:
+                referenced.add(name)
+                if folded in drop_set:
+                    dropped_refs.append(name)
+                elif folded in rename_folded:
+                    edits.append(
+                        (
+                            token.start,
+                            token.end,
+                            _quote_if_bare(token.text, rename_folded[folded]),
+                        )
+                    )
+                continue
+            if previous is not None and previous.text == ".":
+                continue
+            if paren_depth and not in_own_update_set:
+                continue
+            if update_target is not None and not in_own_update_set:
+                # SET target of UPDATE on a *different* table
+                continue
+            if (
+                allow_tables
+                and previous is not None
+                and previous.kind == "word"
+                and previous.text.upper() in _TABLE_INTRODUCING_KEYWORDS
+            ):
+                continue
+            if folded in drop_set:
+                dropped_refs.append(name)
+            elif folded in rename_folded:
+                if in_own_update_set:
+                    edits.append(
+                        (
+                            token.start,
+                            token.end,
+                            _quote_replacement(token.text, rename_folded[folded]),
+                        )
+                    )
+                else:
+                    bare_renamed.append(name)
+
+    if when_span[0] != -1:
+        _scan(tokens[when_span[0] : when_span[1]], when_span[0], False)
+    _scan(tokens[body_span[0] : body_span[1]], body_span[0], True)
+
+    referenced_columns = tuple(
+        sorted(referenced | set(dropped_refs) | set(bare_renamed))
+    )
+    changing = bool(rename or drop_set)
+    if not changing:
+        return TriggerRewrite(
+            recreate=True, sql=sql, referenced_columns=referenced_columns
+        )
+    if dropped_refs:
+        column = sorted(set(dropped_refs))[0]
+        return TriggerRewrite(
+            recreate=False,
+            reason=(
+                f"references dropped column {column!r}; recreate the trigger manually "
+                "after the transform"
+            ),
+            referenced_columns=referenced_columns,
+        )
+    if bare_renamed:
+        column = sorted(set(bare_renamed))[0]
+        return TriggerRewrite(
+            recreate=False,
+            reason=(
+                f"references renamed column {column!r} without a NEW./OLD. qualifier; "
+                "recreate the trigger manually after the transform"
+            ),
+            referenced_columns=referenced_columns,
+        )
+    rewritten = sql
+    for start, end, replacement in reversed(edits):
+        rewritten = rewritten[:start] + replacement + rewritten[end:]
+    return TriggerRewrite(
+        recreate=True, sql=rewritten, referenced_columns=referenced_columns
+    )
